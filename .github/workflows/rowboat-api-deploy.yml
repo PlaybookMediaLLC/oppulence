@@ -215,7 +215,7 @@ jobs:
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
       - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5
       - name: Connect to Tailscale
-        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
       - name: Load kubeconfig
@@ -376,7 +376,7 @@ jobs:
         uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
