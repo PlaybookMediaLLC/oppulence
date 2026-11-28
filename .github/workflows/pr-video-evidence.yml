@@ -1,0 +1,72 @@
+name: PR Video Evidence
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-video-evidence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-video-evidence:
+    name: pr-video-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+
+      - name: Run video-evidence validator unit tests
+        run: node --test scripts/devx/video-evidence/__tests__/*.test.mjs
+
+      - name: Validate PR evidence availability, freshness, metadata, and test results
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          ACTOR: ${{ github.actor }}
+          PR_IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          IS_BOT_EXEMPT="false"
+          if [ "$PR_AUTHOR" = "$ACTOR" ]; then
+            case "$PR_AUTHOR" in
+              "dependabot[bot]"|"release-please[bot]"|"app/dependabot")
+                IS_BOT_EXEMPT="true"
+                ;;
+              "github-actions[bot]")
+                case "$PR_HEAD_REF" in
+                  release-please--*) IS_BOT_EXEMPT="true" ;;
+                esac
+                ;;
+            esac
+          fi
+
+          if [ "$IS_BOT_EXEMPT" = "true" ]; then
+            echo "## PR Video Evidence Check (\`pr-video-evidence\`)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Status: **EXEMPT (Automated maintenance PR by \`$PR_AUTHOR\`)**" >> "$GITHUB_STEP_SUMMARY"
+            echo "[pr-video-evidence] Automated maintenance PR ($PR_AUTHOR): validator tests passed; PR body video requirement exempted."
+            exit 0
+          fi
+
+          set +e
+          node scripts/devx/video-evidence/validate-cli.mjs \
+            --github-event-path "$GITHUB_EVENT_PATH"
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            if [ "$PR_IS_DRAFT" = "true" ]; then
+              echo "::warning::Draft PR does not yet satisfy pr-video-evidence requirements; complete verification before marking ready for review."
+            fi
+            exit "$STATUS"
+          fi

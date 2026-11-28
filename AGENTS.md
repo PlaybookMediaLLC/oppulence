@@ -25,6 +25,19 @@ Install the git hooks once with `pnpm install --ignore-workspace` at the root. L
 and lints staged files on commit and runs the app gates on push. Hooks are fast feedback, not a
 substitute for the final gate; CI is authoritative.
 
+## Mandatory Pull Request Verification, Independent Review & Narrated Video Evidence
+
+Every coding agent — across every thread, model, and task — **MUST** automatically invoke the `pr-video-evidence` skill (repository adaptation: [`.agents/skills/pr-video-evidence/SKILL.md`](.agents/skills/pr-video-evidence/SKILL.md)) before declaring substantive implementation work complete or marking any pull request ready for review.
+
+1. **Understand the change**: Inspect the task, acceptance criteria, diff, affected surfaces, app-specific `AGENTS.md` files, and repository quality gates.
+2. **Independent engineering review (mandatory)**: The implementing agent must never be the sole reviewer of its own work. Dispatch an independent read-only review team (core reviewers: `senior-code-critic`, `review-changes`, `ponytail-review`, plus domain specialists matching touched surfaces). Review-only subagents must not recursively initiate this workflow. Consolidate findings, resolve all P0/P1 defects (and P2 defects unless explicitly accepted by an authorized human reviewer), and obtain independent re-review before generating final video evidence.
+3. **Verify on the real application**: Run the actual application from the branch in an isolated environment with seeded deterministic data (never a simulated mockup or bypassed auth/validation) and pass all applicable automated checks.
+4. **Produce narrated, visually annotated video evidence**: Run `pnpm run devx:video-evidence` (kept strictly separate from silent marketing capture profiles) to produce a **1920 × 1080, 30 fps, MP4 (H.264 + AAC)** with **natural, human-sounding spoken narration** (local **Kokoro-82M** neural TTS default; never robotic formant voices, music, or promotional fluff), visible cursor/clicks/highlights, restrained zooming where helpful, synchronized burned-in + `.srt`/`.vtt` captions, observed outcomes, and relevant error/edge states. For backend/infra changes, narrate terminal/API/DB/test runs; for genuinely non-demonstrable changes, explicitly document why video is inapplicable and attach equivalent verification artifacts.
+5. **Inspect, deliver & enforce evidence integrity**: Verify media codecs, audio loudness/clipping, and visual frames; tie all evidence to the exact `HEAD` commit SHA; store local artifacts only under `.pr-video-evidence/` (gitignored — never commit binary recordings or expose secrets/customer data); attach the playable MP4, consolidated review report, and PR summary block. On human review comments or annotated frames, convert feedback into acceptance criteria, fix, re-review, and record a **fresh** video against the new commit SHA (never reuse stale evidence).
+6. **Readiness & merge rule**: Missing, failed, incomplete, or stale evidence blocks readiness — keep incomplete or blocked PRs in **draft** and report exact blockers truthfully. Never fabricate results, bypass quality gates, or merge without explicit human authorization.
+
+See [`.agents/skills/pr-video-evidence/SKILL.md`](.agents/skills/pr-video-evidence/SKILL.md) for the full repository-specific procedure, reviewer roster, commands, and CI check contract.
+
 ## Reuse Before Writing New Code
 
 A second implementation of an existing component, helper, schema, query, service, or business

@@ -30,4 +30,5 @@ deploy/
 
 # Repo artifacts
 .rowboat-kind/
+.pr-video-evidence/
 coverage/
