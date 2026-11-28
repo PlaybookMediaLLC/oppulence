@@ -1,0 +1,93 @@
+package search_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/ent"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/appconfig"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/auth"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/credits"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/db"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/pricing"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/quota"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/search"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/secrets"
+	"go.uber.org/zap"
+)
+
+func setup(t *testing.T, sanctioned int) (*ent.Client, context.Context, *search.Handler) {
+	t.Helper()
+	d, err := db.Open(context.Background(), appconfig.Config{
+		DatabaseURL: "file:" + t.Name() + "?mode=memory&cache=shared&_pragma=foreign_keys(1)",
+		AutoMigrate: true,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("db: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	bg := context.Background()
+	u := d.Client.User.Create().SetEmail("a@x.co").SetWorkosUserID("user_1").SaveX(bg)
+	userCtx := auth.WithUser(bg, u)
+	d.Client.Subscription.Create().SetUser(u).SetSanctionedCredits(sanctioned).SaveX(userCtx)
+	sec := secrets.NewFromConfig(appconfig.Config{ExaAPIKey: "exa-key"})
+	h := search.New(pricing.DefaultTable(), quota.New(d.Client, zap.NewNop()), sec, zap.NewNop())
+	return d.Client, userCtx, h
+}
+
+func TestSearchProxiesAndCharges(t *testing.T) {
+	client, ctx, h := setup(t, 10000)
+	var gotKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"results":[{"title":"t","url":"u"}]}`))
+	}))
+	defer upstream.Close()
+	h.SetUpstream(upstream.URL)
+
+	body := `{"query":"golang","numResults":5,"type":"auto"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/exa", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Idempotency-Key", "search-1")
+	rec := httptest.NewRecorder()
+	h.Search(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"results"`) {
+		t.Errorf("response not relayed: %s", rec.Body.String())
+	}
+	if gotKey != "exa-key" {
+		t.Errorf("upstream x-api-key = %q", gotKey)
+	}
+	// Flat 50-credit charge.
+	if avail, _ := credits.Available(ctx, client, 10000); avail != 9950 {
+		t.Fatalf("available = %d, want 9950", avail)
+	}
+}
+
+func TestSearchUpstreamErrorIsRedactedAndRefunded(t *testing.T) {
+	client, ctx, h := setup(t, 10000)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"secret provider account acct_123"}`))
+	}))
+	defer upstream.Close()
+	h.SetUpstream(upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/exa", strings.NewReader(`{"query":"golang"}`)).WithContext(ctx)
+	req.Header.Set("Idempotency-Key", "search-upstream-redaction")
+	rec := httptest.NewRecorder()
+	h.Search(rec, req)
+	if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), "acct_123") {
+		t.Fatalf("response = %d %s, want redacted 502", rec.Code, rec.Body.String())
+	}
+	if avail, _ := credits.Available(ctx, client, 10000); avail != 10000 {
+		t.Fatalf("available after refund = %d, want 10000", avail)
+	}
+}

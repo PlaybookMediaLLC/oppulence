@@ -51,7 +51,7 @@ following changes are **in development**:
 Capture ingestion already has a versioned handoff. Accepting a transcript is not
 proof that it has been linked to a person or used in a response. See the current
 implementation status in
-[RFC 055](./apps/rfc/055-capture-product-boundary-and-rowboat-integration.md).
+[RFC 055](./docs/rfc/055-capture-product-boundary-and-oppulence-integration.md).
 
 ## The workflow we are building around
 
@@ -108,7 +108,7 @@ marketing dashboard or a second memory system.
 
 The existing commitment register, account views, attention queue, and knowledge
 graph remain useful tools inside this broader assistant experience. The
-[relationship-state architecture](./apps/rfc/036-relationship-state-engine.md)
+[relationship-state architecture](./docs/rfc/036-relationship-state-engine.md)
 describes their underlying evidence model.
 
 ## Actions you can review
@@ -155,7 +155,7 @@ Install the capabilities you need; the complete Voice-to-memory journey is still
 being integrated.
 
 For desktop Google connections, follow [Google setup](./google-setup.md).
-Optional desktop provider configuration lives under `~/.rowboat/config/`:
+Optional desktop provider configuration lives under `~/.oppulence/config/`:
 
 | Capability                  | Configuration file |
 | --------------------------- | ------------------ |
@@ -172,39 +172,21 @@ The optional Deepgram, ElevenLabs, and Exa key files use this format:
 ```
 
 Model configuration and supported local or hosted providers are documented in
-[the desktop engineering guide](./apps/x/AGENTS.md). Review an MCP server's access
+[the desktop engineering guide](./clients/apps/desktop/AGENTS.md). Review an MCP server's access
 before connecting it, especially when it can send messages or change data.
 
 ## Develop locally
 
-The desktop is a nested pnpm workspace. From the repository root:
-
 ```bash
-cd apps/x
-pnpm install
-npm run deps
-npm run dev
+brew bundle             # Docker Desktop, Node 24, pnpm 10, Go
+./dev/cli.mjs install   # once: adds the `dev` command to your shell
+dev up                  # secrets, dependencies, and the local backend
+dev start               # web app + desktop
 ```
 
-For desktop compilation and lint checks:
-
-```bash
-npm run deps
-npm run lint
-```
-
-For the public site and web application:
-
-```bash
-cd apps/rowboat-www
-npm ci
-npm run dev
-```
-
-See the [web README](./apps/rowboat-www/README.md) for the local API stack and
-[quality checks](./apps/rowboat-www/quality/README.md). Backend setup and deployment
-are covered in the [API README](./apps/rowboat-api/README.md) and
-[deployment guide](./docs/BACKEND_DEPLOYMENT.md).
+[DEVELOPMENT.md](./DEVELOPMENT.md) covers every `dev` command, the secrets the
+backend needs, local ports, and the checks to run before a PR. Deployment is in
+the [deployment guide](./docs/BACKEND_DEPLOYMENT.md).
 
 ---
 
@@ -212,37 +194,33 @@ are covered in the [API README](./apps/rowboat-api/README.md) and
 
 Web and Desktop share the API in this monorepo. Voice remains a separate
 companion repository, connected through the versioned capture contract in
-[RFC 055](./apps/rfc/055-capture-product-boundary-and-rowboat-integration.md).
+[RFC 055](./docs/rfc/055-capture-product-boundary-and-oppulence-integration.md).
 The shared assistant experience is the product direction; it does not imply
 that every workflow or local artifact already syncs between applications.
 
 The main components in this repository are:
 
-1. **Oppulence Web (`apps/rowboat-www`)** — the browser workspace for connected
+1. **Oppulence Web (`clients/apps/web`)** — the browser workspace for connected
    relationships, source review, assistant conversations, and approvals.
    Today, Inbox, People, Library, and Activity are the target experience.
-2. **Oppulence Desktop (`apps/x`)** — the full native workspace with email,
+2. **Oppulence Desktop (`clients/apps/desktop`)** — the full native workspace with email,
    local files, notes, an embedded browser, and native tools.
-3. **Oppulence API (`apps/rowboat-api`)** — the relationship state engine,
+3. **Oppulence API (`server`)** — the relationship state engine,
    evidence and assertion history, connector broker, and always-on execution
    plane shared by both clients.
 
-`apps/rowboatx` remains a UI exploration and `apps/rowboat` remains the older
-hosted agent-builder platform. They are supporting codebases, not the center of
-the relationship-intelligence product direction.
-
 ### Primary surfaces
 
-**1. Oppulence Web (`apps/rowboat-www`)** — the browser client for the same
+**1. Oppulence Web (`clients/apps/web`)** — the browser client for the same
 relationship state and workflows available on desktop. It also contains the
 public product site.
 
-**2. Oppulence Desktop (`apps/x`)** — the Electron client and local observation
+**2. Oppulence Desktop (`clients/apps/desktop`)** — the Electron client and local observation
 client. It adds local context and native tools; common navigation and
 workflow parity with Web remain part of the product roadmap.
 
 ```
-apps/x/
+clients/apps/desktop/
 ├── apps/
 │   ├── main/        # Electron main process (Node) — main.ts
 │   ├── renderer/    # React 19 + Vite UI
@@ -255,16 +233,16 @@ apps/x/
 Build chain: `shared -> core -> preload -> renderer/main`. `npm run deps` builds
 the workspaces; esbuild bundles the main process to a single CommonJS file
 because Electron Forge's dependency walker cannot follow pnpm symlinks. See
-[`apps/x/LIVE_NOTE.md`](./apps/x/docs/LIVE_NOTE.md) for the live-note runtime.
+[`clients/apps/desktop/LIVE_NOTE.md`](./clients/apps/desktop/docs/LIVE_NOTE.md) for the live-note runtime.
 
-**3. Oppulence API (`apps/rowboat-api`)** — the Go service for canonical
+**3. Oppulence API (`server`)** — the Go service for canonical
 relationship state, observations, assertions, projections, source health, and
 always-on work. It also provides WorkOS authentication, billing and credits,
 the LLM gateway, provider proxies, OAuth, background tasks, event ingestion,
 Temporal workflows, durable agent sessions, and OpenAPI.
 
 ```
-apps/rowboat-api/
+server/
 ├── cmd/
 │   ├── server/       # HTTP API, auth, connectors, LLM, events, background task routes
 │   ├── worker/       # Temporal worker for API-native jobs and durable agents
@@ -276,100 +254,27 @@ apps/rowboat-api/
 This shared service owns relationship state and API-backed background work,
 including event processing, recommendations, approved actions, and connector
 repair. Desktop-only tasks still depend on the local application. See
-[apps/rowboat-api/README.md](./apps/rowboat-api/README.md),
-[apps/rfc/README.md](./apps/rfc/README.md), and
-[RFC 036](./apps/rfc/036-relationship-state-engine.md).
-
-**4. RowboatX (`apps/rowboatx`)** — Next.js frontend exploration for artifacts,
-task queues, tool traces, conversations, JSON/Markdown editors, and app
-navigation.
-
-**5. Rowboat Platform (`apps/rowboat`)** — older Next.js app that hosts
-projects, workflows, the visual agent builder, RAG, and the chat widget API.
-Its layering is:
-
-```
-apps/rowboat/src/
-├── application/        # use-cases (agents-runtime, copilot, …)
-├── entities/           # models (copilot, workflow, …)
-├── infrastructure/     # adapters (Mongo, Qdrant, Redis, providers)
-└── interface-adapters/
-```
-
-Plus Next.js routes under `app/api/` — `app/api/widget/v1/*` is what the chat widget calls; `app/api/v1/*` is the public Oppulence API.
+[server/README.md](./server/README.md),
+[docs/rfc/README.md](./docs/rfc/README.md), and
+[RFC 036](./docs/rfc/036-relationship-state-engine.md).
 
 ### Surrounding apps
 
-| Path                                  | What it is                                                                                                                          |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/cli`                            | CLI tool.                                                                                                                           |
-| `apps/python-sdk`                     | The `rowboat` PyPI client (used by `simulation_runner`).                                                                            |
-| `apps/docs`                           | Docs site, shipped on port 8000 via the `docs` profile.                                                                             |
-| `apps/experimental/chat_widget`       | Iframe-embedded end-user chat. Talks to platform at `/api/widget/v1`.                                                               |
-| `apps/experimental/simulation_runner` | Async Python worker — polls `test_runs` in Mongo, role-plays scenarios via OpenAI against a Rowboat workflow, writes verdicts back. |
-| `apps/experimental/tools_webhook`     | Reference Flask service that Rowboat tool-calls can POST to.                                                                        |
-
-### Runtime composition (platform side)
-
-`docker-compose.yml` is the orchestration spine. Active services:
-
-```
-rowboat        :3000   Next.js app (Dockerfile)
-jobs-worker             scripts.Dockerfile, runs `npm run jobs-worker`
-rag-worker              scripts.Dockerfile, runs `npm run rag-worker` (profile: rag-worker)
-mongo          :27017   official image, data → ./data/mongo
-redis          :6379    official image
-qdrant         :6333    Dockerfile.qdrant (profile: qdrant), data → ./data/qdrant
-setup_qdrant            one-shot init via `npm run setupQdrant` (profile: setup_qdrant)
-docs           :8000    (profile: docs)
-```
-
-Commented-out but pre-wired: `rowboat_agents:3001`, `copilot:3002`, `tools_webhook:3005`, `simulation_runner`, `chat_widget:3006`, `twilio_handler:4010`. The agents service and copilot run **outside** the compose stack in the current setup — `rowboat` reaches them at `AGENTS_API_URL` / `COPILOT_API_URL`.
-
-Three roles share one image: the `Dockerfile` runs the long-running Next server; `scripts.Dockerfile` runs the same bundle with `npm run jobs-worker` / `rag-worker` / `setupQdrant` / `deleteQdrant`. **The worker containers are the same Node bundle running a different `package.json` script**, not separate codebases.
-
-`start.sh` is the dev entry point: sets `USE_RAG=true`, `USE_KLAVIS_TOOLS=true`, then runs `docker compose --profile setup_qdrant --profile qdrant --profile rag-worker up --build`.
-
-### Request flow
-
-```
-End-user site
-  └─ <script src=".../bootstrap.js">  →  chat_widget  (apps/experimental/chat_widget)
-                                          │ /api/bootstrap.js substitutes CHAT_WIDGET_HOST / ROWBOAT_HOST
-                                          ▼
-                                   iframe (chat UI) ──fetch──> rowboat  (Next.js)
-                                                                 │  /api/widget/v1/{session,chats,messages,turn}
-                                                                 ▼
-                                                 ┌──────────────────────────────┐
-                                                 │ rowboat platform             │
-                                                 │  ├─ Mongo (state)            │
-                                                 │  ├─ Redis (queues/cache)     │
-                                                 │  ├─ Qdrant (vectors)         │
-                                                 │  ├─ jobs-worker  (async)     │
-                                                 │  ├─ rag-worker   (ingest)    │
-                                                 │  ├─ rowboat_agents (LLM)     │
-                                                 │  └─ copilot      (LLM)       │
-                                                 └──────────────────────────────┘
-                                                                 │
-                                            ┌────────────────────┴──────────────────┐
-                                            ▼                                       ▼
-                                     tool webhooks                      simulation_runner (poll loop)
-                                     (e.g. tools_webhook)               picks up test_runs, role-plays,
-                                                                        writes results
-```
-
-Two persistent workers handle async work outside the request lifecycle:
-
-- **`jobs-worker`** — generic background queue (Redis-backed), needs Mongo + provider keys.
-- **`rag-worker`** — document ingestion: pulls from S3 or `./data/uploads`, embeds, writes to Qdrant. Optional Gemini parsing, Firecrawl scraping.
+| Path                          | What it is                                                                                                                                 |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `clients/apps/cli`            | CLI tool.                                                                                                                                  |
+| `clients/apps/docs`           | Docs site.                                                                                                                                 |
+| `sdk/typescript`              | TypeScript SDK (`@oppulence/sdk`), generated from `server/api/openapi.json`.                                                               |
+| `sdk/python`                  | The `rowboat` PyPI client.                                                                                                                 |
+| `clients/apps/experimental/*` | Chat widget, simulation runner, and tool-webhook reference: satellites of the retired hosted platform, not wired into any current surface. |
 
 ### Deployment paths
 
 The primary surfaces ship through **separate pipelines**.
 
-**Desktop (`apps/x`)** is the only thing released from this repo's tags. Triggered on push to `main` via [`.github/workflows/release.yml`](./.github/workflows/release.yml):
+**Desktop (`clients/apps/desktop`)** is the only thing released from this repo's tags. Triggered on push to `main` via [`.github/workflows/release.yml`](./.github/workflows/release.yml):
 
-1. `release-please` scans commits under `apps/x/` (per `.release-please-config.json`). On a `feat:`/`fix:`/`feat!:`, it opens (or updates) a Release PR with a `CHANGELOG.md` bump + version. Merging that PR causes the next push to produce `release_created: true` and a tag `apps/x@vX.Y.Z`.
+1. `release-please` scans commits under `clients/apps/desktop/` (per `.release-please-config.json`). On a `feat:`/`fix:`/`feat!:`, it opens (or updates) a Release PR with a `CHANGELOG.md` bump + version. Merging that PR causes the next push to produce `release_created: true` and a tag `clients/apps/desktop@vX.Y.Z`.
 2. Three parallel builders fan out from the tag: `build-macos` (imports Apple cert into a temp keychain, makes `.dmg` + `.zip` for arm64 + x64), `build-linux` (`.deb` / `.rpm` / `.zip` per arch), `build-windows` (Squirrel `.exe` + portable `.zip`).
 3. Publish job attaches 16 installer assets + SPDX/CycloneDX SBOMs to the GitHub Release.
 4. Installed clients use `update-electron-app` with the project's GitHub
@@ -379,7 +284,7 @@ The primary surfaces ship through **separate pipelines**.
 Build and publication time depends on the release workflow. See [Distribution and operations](#distribution-and-operations)
 below.
 
-**Oppulence API (`apps/rowboat-api`)** has its own quality and deploy workflows:
+**Oppulence API (`server`)** has its own quality and deploy workflows:
 [`.github/workflows/rowboat-api-quality.yml`](./.github/workflows/rowboat-api-quality.yml)
 and
 [`.github/workflows/rowboat-api-deploy.yml`](./.github/workflows/rowboat-api-deploy.yml).
@@ -389,46 +294,23 @@ the relationship-state and execution plane shared by the web and desktop
 clients. That file starts Temporal and the worker; assistant chat calls
 OpenRouter, so the root `.env` needs `OPENROUTER_API_KEY`.
 
-**Platform (`apps/rowboat`)** is source-distributed rather than pushed to a
-registry. Users run `./start.sh` locally or in their own infrastructure, which
-builds the images from source and brings up the Compose stack. Feature flags
-toggle behavior:
-
-| Flag                                                  | Effect                                            |
-| ----------------------------------------------------- | ------------------------------------------------- |
-| `USE_RAG`, `USE_RAG_UPLOADS`, `USE_RAG_S3_UPLOADS`    | Enables vector store, file uploads, S3 ingestion. |
-| `USE_RAG_SCRAPING` + `FIRECRAWL_API_KEY`              | Web ingestion.                                    |
-| `USE_CHAT_WIDGET` + `CHAT_WIDGET_HOST`                | Mounts the widget endpoints.                      |
-| `USE_KLAVIS_TOOLS`                                    | Tool integrations.                                |
-| `USE_BILLING` + `BILLING_API_URL` / `BILLING_API_KEY` | Talks to an external billing service.             |
-| `USE_AUTH`                                            | Auth0-gated SSR.                                  |
-
 ### CI side-jobs
 
-- [`rowboat-build.yml`](./.github/workflows/rowboat-build.yml) — typecheck/build for `apps/rowboat`.
+- [`oppulence-build.yml`](./.github/workflows/oppulence-build.yml) — `verify:ci` for `clients/apps/web`.
 - [`rowboat-api-quality.yml`](./.github/workflows/rowboat-api-quality.yml) / [`rowboat-api-deploy.yml`](./.github/workflows/rowboat-api-deploy.yml) — Go API quality and deploy gates.
 - [`electron-build.yml`](./.github/workflows/electron-build.yml) / [`x-publish.yml`](./.github/workflows/x-publish.yml) / [`x-smoke-test.yml`](./.github/workflows/x-smoke-test.yml) — desktop CI gates (lint, packaging dry-run, smoke test).
 - [`pr-title-lint.yml`](./.github/workflows/pr-title-lint.yml) — enforces Conventional Commits on PR titles, so release-please works.
 
-### Where the experimental apps fit
-
-- **`chat_widget`** is part of the **platform** stack (currently commented out in compose; would run on `:3006`). Depends on `rowboat` for `/api/widget/v1/*` and uses `CHAT_WIDGET_SESSION_JWT_SECRET`. Not part of the desktop release.
-- **`simulation_runner`** is a backend test harness. It reads `test_runs` from the platform's Mongo and runs the workflow at `ROWBOAT_API_HOST`. Platform-side, currently off in compose.
-- **`tools_webhook`** is a **reference implementation** for customer tool webhooks (signed-request handling, function dispatch) — not deployed by Rowboat itself.
-
 ### Summary
 
-- Oppulence Web (`apps/rowboat-www`) is the **browser workspace** for
+- Oppulence Web (`clients/apps/web`) is the **browser workspace** for
   relationship context, assistant work, source review, and approvals.
-- Oppulence Desktop (`apps/x`) is the **full native workspace** — release-please + electron-forge + GitHub Releases +
+- Oppulence Desktop (`clients/apps/desktop`) is the **full native workspace** — release-please + electron-forge + GitHub Releases +
   auto-update.
-- Oppulence API (`apps/rowboat-api`) is the **relationship-state and always-on
+- Oppulence API (`server`) is the **relationship-state and always-on
   execution plane** — observations, assertions, projections, source health,
   scheduled jobs, event routing, connectors, LLM gateway, Temporal, durable
   agents, and observability.
-- RowboatX (`apps/rowboatx`) is a **supporting UI exploration** for artifacts,
-  queues, tools, tasks, and conversations.
-- Web platform (`apps/rowboat`) is the **older self-hosted agent-builder platform** — one Next.js image runs as three roles (server, jobs-worker, rag-worker), plus Mongo/Redis/Qdrant, with `rowboat_agents` + `copilot` as separate LLM services and the experimental apps as optional satellites.
 - These surfaces share repo-level contracts and clients where useful, but have independent release and deployment paths.
 
 ---
@@ -439,7 +321,7 @@ toggle behavior:
 
 Download installers from the project's releases page:
 
-**Latest release:** https://github.com/Oppulence-Engineering/rowboat/releases/latest
+**Latest release:** https://github.com/PlaybookMediaLLC/oppulence/releases/latest
 
 Each release ships 16 installer assets covering the full Mac/Windows/Linux matrix (macOS `.dmg` and `.zip` for both arm64 and x64; Linux `.deb`, `.rpm`, and `.zip` for arm64 and x86_64; Windows Squirrel `.exe` installer plus a portable `.zip`), plus two supply-chain SBOMs (SPDX 2.3 and CycloneDX 1.5) so consumers can scan dependencies for known CVEs without rebuilding from source.
 
@@ -457,12 +339,12 @@ Oppulence uses [PostHog](https://posthog.com/) for product analytics and
 exception capture. The main process registers `uncaughtException` and
 `unhandledRejection` handlers through `posthog-node`; the renderer uses
 `posthog-js` with exception capture enabled. See
-[ANALYTICS.md](./apps/x/docs/ANALYTICS.md) for the event taxonomy and opt-out
+[ANALYTICS.md](./clients/apps/desktop/docs/ANALYTICS.md) for the event taxonomy and opt-out
 instructions.
 
 ### Release process
 
-Releases follow [Conventional Commits](https://www.conventionalcommits.org/). When a PR with a `feat:`, `fix:`, or `feat!:`/`fix!:` commit (squash-merged into `main`) touches `apps/x/`, [release-please](https://github.com/googleapis/release-please) automatically opens a release PR with the version bump and changelog entry. Merging that PR cuts a tag, triggers parallel macOS/Linux/Windows builds via electron-forge, attaches all 16 installer assets to the GitHub Release, and uploads SBOMs.
+Releases follow [Conventional Commits](https://www.conventionalcommits.org/). When a PR with a `feat:`, `fix:`, or `feat!:`/`fix!:` commit (squash-merged into `main`) touches `clients/apps/desktop/`, [release-please](https://github.com/googleapis/release-please) automatically opens a release PR with the version bump and changelog entry. Merging that PR cuts a tag, triggers parallel macOS/Linux/Windows builds via electron-forge, attaches all 16 installer assets to the GitHub Release, and uploads SBOMs.
 
 ### Security
 

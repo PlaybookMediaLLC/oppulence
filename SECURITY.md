@@ -2,11 +2,11 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Rowboat (Oppulence Engineering fork) or in the desktop application shipped from this repository, please report it privately.
+If you discover a security vulnerability in Oppulence, Oppulence Engineering's fork of Rowboat or in the desktop application shipped from this repository, please report it privately.
 
 **Preferred channel:** email **admin@solomon-ai.co** with the subject line `SECURITY` and a clear description of the issue. If the issue is sensitive, you may also send a separate follow-up with reproduction steps.
 
-**Alternative channel:** use GitHub's private vulnerability reporting via the [Security tab](https://github.com/Oppulence-Engineering/rowboat/security/advisories/new) of this repository.
+**Alternative channel:** use GitHub's private vulnerability reporting via the [Security tab](https://github.com/PlaybookMediaLLC/oppulence/security/advisories/new) of this repository.
 
 Please do **not** open a public issue, discussion, or pull request for security vulnerabilities.
 
@@ -15,7 +15,7 @@ Please do **not** open a public issue, discussion, or pull request for security 
 A good report contains:
 
 - A description of the vulnerability and the impact you believe it has.
-- - Step-by-step reproduction instructions, including the affected version (look in the app's About dialog or `apps/x/apps/main/package.json`).
+- - Step-by-step reproduction instructions, including the affected version (look in the app's About dialog or `clients/apps/desktop/apps/main/package.json`).
   - - Any proof-of-concept code, logs, screenshots, or network captures that help us verify the issue.
     - - Whether the vulnerability is, to your knowledge, already public.
      
@@ -30,7 +30,7 @@ A good report contains:
              
               - In scope:
              
-              - - The Electron desktop application under `apps/x/`.
+              - - The Electron desktop application under `clients/apps/desktop/`.
                 - - The release and CI pipeline under `.github/workflows/` (e.g., supply-chain issues, signing key handling).
                   - - Build, packaging, and distribution configuration that ships in user-facing artifacts.
                    

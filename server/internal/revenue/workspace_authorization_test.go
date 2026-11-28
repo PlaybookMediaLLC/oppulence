@@ -1,0 +1,164 @@
+package revenue
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/ent"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/auth"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/db"
+)
+
+func TestCurrentWorkspaceForOrgUsesExactClaimAndNeverCreates(t *testing.T) {
+	f := newFixture(t)
+	internal := auth.WithInternal(context.Background())
+	user, err := f.user.Update().SetWorkosOrgID("org_a").Save(internal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := auth.WithUser(context.Background(), user)
+	workspaceA, err := f.svc.CurrentWorkspace(ctx, user)
+	if err != nil {
+		t.Fatalf("create org A workspace: %v", err)
+	}
+	ownerB := f.client.User.Create().
+		SetEmail("owner-b@example.com").
+		SetWorkosUserID("user_owner_b").
+		SetWorkosOrgID("org_b").
+		SaveX(internal)
+	workspaceB := f.client.RevenueWorkspace.Create().SetUser(ownerB).SetWorkosOrgID("org_b").SaveX(internal)
+	f.client.RevenueWorkspaceMember.Create().SetWorkspace(workspaceB).SetUser(user).SetRole("member").SetStatus("active").SaveX(internal)
+
+	selected, err := f.svc.CurrentWorkspaceForOrg(ctx, user, "org_b")
+	if err != nil || selected.ID != workspaceB.ID {
+		t.Fatalf("exact org B workspace: got=%v err=%v", selected, err)
+	}
+	selected, err = f.svc.CurrentWorkspaceForOrg(ctx, user, "org_a")
+	if err != nil || selected.ID != workspaceA.ID {
+		t.Fatalf("exact org A workspace: got=%v err=%v", selected, err)
+	}
+
+	workspaceCount := f.client.RevenueWorkspace.Query().CountX(internal)
+	membershipCount := f.client.RevenueWorkspaceMember.Query().CountX(internal)
+	if _, err := f.svc.CurrentWorkspaceForOrg(ctx, user, ""); !ent.IsNotFound(err) {
+		t.Fatalf("org-less current claim must be denied, got %v", err)
+	}
+	if _, err := f.svc.CurrentWorkspaceForOrg(ctx, user, "org_missing"); !ent.IsNotFound(err) {
+		t.Fatalf("unknown current org must be denied, got %v", err)
+	}
+	if got := f.client.RevenueWorkspace.Query().CountX(internal); got != workspaceCount {
+		t.Fatalf("authorization lookup created workspace: %d -> %d", workspaceCount, got)
+	}
+	if got := f.client.RevenueWorkspaceMember.Query().CountX(internal); got != membershipCount {
+		t.Fatalf("authorization lookup created membership: %d -> %d", membershipCount, got)
+	}
+}
+
+func TestWorkspaceRoleAndResourceAuthorizationMatrix(t *testing.T) {
+	f := newFixture(t)
+	ownerWorkspace, err := f.svc.CurrentWorkspace(f.ctx, f.user)
+	if err != nil {
+		t.Fatalf("owner workspace: %v", err)
+	}
+	rel := f.relationship(t)
+
+	memberUser := newUser(t, f.client, "member@x.co", "user_workspace_member")
+	member, err := f.svc.UpsertWorkspaceMember(f.ctx, f.user, memberUser.ID, "member")
+	if err != nil {
+		t.Fatalf("grant member: %v", err)
+	}
+	memberCtx := auth.WithUser(f.ctx, memberUser)
+	memberWorkspace, err := f.svc.CurrentWorkspace(memberCtx, memberUser)
+	if err != nil || memberWorkspace.ID != ownerWorkspace.ID {
+		t.Fatalf("member workspace: ws=%#v err=%v", memberWorkspace, err)
+	}
+	if got, err := f.svc.GetRelationship(memberCtx, rel.ID); err != nil || got.ID != rel.ID {
+		t.Fatalf("member cannot read shared relationship: rel=%#v err=%v", got, err)
+	}
+	if _, err := f.svc.CreateRelationship(memberCtx, memberUser, RelationshipInput{
+		Kind: "company", DisplayName: "Member-created account",
+	}); err != nil {
+		t.Fatalf("member contribute: %v", err)
+	}
+	if _, err := rel.Update().SetSummary("member update").Save(memberCtx); err != nil {
+		t.Fatalf("database boundary rejected member write: %v", err)
+	}
+	if _, err := f.svc.UpsertWorkspaceMember(memberCtx, memberUser, f.user.ID, "viewer"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("member must not manage members, got %v", err)
+	}
+
+	viewerUser := newUser(t, f.client, "viewer@x.co", "user_workspace_viewer")
+	viewer, err := f.svc.UpsertWorkspaceMember(f.ctx, f.user, viewerUser.ID, "viewer")
+	if err != nil {
+		t.Fatalf("grant viewer: %v", err)
+	}
+	viewerCtx := auth.WithUser(f.ctx, viewerUser)
+	if got, err := f.svc.GetRelationship(viewerCtx, rel.ID); err != nil || got.ID != rel.ID {
+		t.Fatalf("viewer read: rel=%#v err=%v", got, err)
+	}
+	if _, err := f.svc.CreateRelationship(viewerCtx, viewerUser, RelationshipInput{
+		Kind: "company", DisplayName: "Forbidden account",
+	}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("viewer service write must fail with ErrForbidden, got %v", err)
+	}
+	if _, err := rel.Update().SetSummary("viewer corruption").Save(viewerCtx); err == nil || !ent.IsNotFound(err) {
+		t.Fatalf("viewer direct mutation must fail closed, got %v", err)
+	}
+
+	adminUser := newUser(t, f.client, "admin@x.co", "user_workspace_admin")
+	if _, err := f.svc.UpsertWorkspaceMember(f.ctx, f.user, adminUser.ID, "admin"); err != nil {
+		t.Fatalf("owner grant admin: %v", err)
+	}
+	adminCtx := auth.WithUser(f.ctx, adminUser)
+	invitee := newUser(t, f.client, "invitee@x.co", "user_workspace_invitee")
+	if _, err := f.svc.UpsertWorkspaceMember(adminCtx, adminUser, invitee.ID, "member"); err != nil {
+		t.Fatalf("admin grant member: %v", err)
+	}
+	if _, err := f.svc.UpsertWorkspaceMember(adminCtx, adminUser, invitee.ID, "admin"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("only owner may grant admin, got %v", err)
+	}
+	peerAdmin := newUser(t, f.client, "peer-admin@x.co", "user_workspace_peer_admin")
+	if _, err := f.svc.UpsertWorkspaceMember(f.ctx, f.user, peerAdmin.ID, "admin"); err != nil {
+		t.Fatalf("owner grant peer admin: %v", err)
+	}
+	if _, err := f.svc.UpsertWorkspaceMember(adminCtx, adminUser, peerAdmin.ID, "viewer"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("admin demoted peer admin: %v", err)
+	}
+	if _, err := f.svc.UpsertWorkspaceMember(f.ctx, f.user, peerAdmin.ID, "viewer"); err != nil {
+		t.Fatalf("owner could not demote peer admin: %v", err)
+	}
+
+	if _, err := f.svc.RemoveWorkspaceMember(f.ctx, f.user, member.ID); err != nil {
+		t.Fatalf("remove member: %v", err)
+	}
+	if _, err := f.svc.GetRelationship(memberCtx, rel.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("removed member retained resource access: %v", err)
+	}
+	if _, err := f.svc.RemoveWorkspaceMember(f.ctx, f.user, viewer.ID); err != nil {
+		t.Fatalf("remove viewer: %v", err)
+	}
+}
+
+func TestWorkspaceBoundaryRejectsUnrelatedTenant(t *testing.T) {
+	f := newFixture(t)
+	rel := f.relationship(t)
+	intruder := newUser(t, f.client, "unrelated@x.co", "user_unrelated_workspace")
+	intruderCtx := auth.WithUser(f.ctx, intruder)
+
+	if _, err := f.svc.GetRelationship(intruderCtx, rel.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-workspace relationship read: %v", err)
+	}
+	if _, err := rel.Update().SetSummary("cross-tenant corruption").Save(intruderCtx); err == nil {
+		t.Fatal("cross-workspace direct mutation succeeded")
+	}
+	if _, err := f.client.RevenueWorkspaceMember.Create().
+		SetWorkspaceID(rel.QueryWorkspace().OnlyX(f.ctx).ID).
+		SetUser(intruder).
+		SetRole("member").
+		Save(intruderCtx); !errors.Is(err, db.ErrTenantMutation) {
+		// Creation requires a workspace edge and actor-safe service path; direct
+		// self-enrollment must never become the authorization API.
+		t.Fatalf("direct self-enrollment must fail closed, got %v", err)
+	}
+}

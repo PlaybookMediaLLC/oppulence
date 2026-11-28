@@ -1,0 +1,234 @@
+package auth
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/ent"
+	"github.com/PlaybookMediaLLC/oppulence/server/ent/deletedidentity"
+	"github.com/PlaybookMediaLLC/oppulence/server/ent/termsassent"
+	"github.com/PlaybookMediaLLC/oppulence/server/ent/user"
+	oauthrs "github.com/PlaybookMediaLLC/oppulence/server/oauth-resource-server"
+	"go.uber.org/zap"
+)
+
+// Enricher fetches user metadata (email, org) not present in the access token.
+// The WorkOS implementation calls the WorkOS API; the noop is used in dev/test.
+type Enricher interface {
+	Email(ctx context.Context, workosUserID string) (string, error)
+	// DeleteUser removes the identity during account deletion.
+	DeleteUser(ctx context.Context, workosUserID string) error
+	// ListAuthFactorTypes returns enrolled second-factor types. Account
+	// deletion uses this to refuse an email code when a stronger factor exists.
+	// An error fails closed: an unknown enrollment must not unlock email OTP.
+	ListAuthFactorTypes(ctx context.Context, workosUserID string) ([]string, error)
+	// RevokeSessions invalidates every live identity-provider session so a
+	// stolen cookie cannot keep acting after the account is gone.
+	RevokeSessions(ctx context.Context, workosUserID string) error
+}
+
+// NoopEnricher returns no enrichment.
+type NoopEnricher struct{}
+
+// Email implements Enricher.
+func (NoopEnricher) Email(context.Context, string) (string, error) { return "", nil }
+
+// DeleteUser does nothing: there is no WorkOS identity without an API key.
+func (NoopEnricher) DeleteUser(context.Context, string) error { return nil }
+
+// ListAuthFactorTypes reports no factors. Local dev has no identity provider
+// to ask, so email OTP stays available when the mailer is configured.
+func (NoopEnricher) ListAuthFactorTypes(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+// RevokeSessions does nothing: there is no remote session store to clear.
+func (NoopEnricher) RevokeSessions(context.Context, string) error { return nil }
+
+// ErrIdentityDeleted means that the token belongs to a deleted account. The
+// token can stay valid until it expires, but it must not create the account
+// again.
+var ErrIdentityDeleted = errors.New("auth: account was deleted")
+
+// DeletedIdentityKey is the tombstone key of a deleted account: a SHA-256 hash
+// of the WorkOS user id, so the tombstone holds no personal data.
+func DeletedIdentityKey(workosUserID string) string {
+	sum := sha256.Sum256([]byte(workosUserID))
+	return hex.EncodeToString(sum[:])
+}
+
+// ResolveUser upserts the local user mirror for a verified token: it returns
+// the existing user (best-effort email refresh) or creates one on first sight,
+// minting a free-tier subscription. User is not a tenant-scoped entity, so this
+// runs without a viewer already in context.
+func (m *Middleware) ResolveUser(ctx context.Context, claims *oauthrs.Claims) (*ent.User, error) {
+	if claims.WorkOSUserID == "" {
+		return nil, fmt.Errorf("token has no workos_user_id")
+	}
+
+	u, err := m.client.User.Query().
+		Where(user.WorkosUserIDEQ(claims.WorkOSUserID)).
+		Only(ctx)
+	switch {
+	case err == nil:
+		return m.refreshUser(ctx, u, claims), nil
+	case ent.IsNotFound(err):
+		deleted, dErr := m.client.DeletedIdentity.Query().
+			Where(deletedidentity.KeyHashEQ(DeletedIdentityKey(claims.WorkOSUserID))).
+			Exist(ctx)
+		if dErr != nil {
+			return nil, dErr
+		}
+		if deleted {
+			return nil, ErrIdentityDeleted
+		}
+		return m.createUser(ctx, claims)
+	default:
+		return nil, err
+	}
+}
+
+// refreshUser keeps the local mirror in step with the token: it refreshes the
+// email when it changes and maps the organization claim when the token's org
+// differs from the stored one (RFC 011 org mapping: "known org" / "user
+// switched org"). Mirror updates are best-effort — a write failure logs and
+// returns the existing row rather than failing the request.
+func (m *Middleware) refreshUser(ctx context.Context, u *ent.User, claims *oauthrs.Claims) *ent.User {
+	emailChanged := claims.Email != "" && u.Email != claims.Email
+	orgOp := ""
+	if claims.WorkOSOrgID != "" && u.WorkosOrgID != claims.WorkOSOrgID {
+		if u.WorkosOrgID == "" {
+			orgOp = "set"
+		} else {
+			orgOp = "switched"
+		}
+	}
+	if !emailChanged && orgOp == "" {
+		m.recordTermsAssent(ctx, u)
+		return u
+	}
+
+	upd := u.Update()
+	if emailChanged {
+		upd = upd.SetEmail(claims.Email)
+	}
+	if orgOp != "" {
+		upd = upd.SetWorkosOrgID(claims.WorkOSOrgID)
+	}
+	updated, uErr := upd.Save(ctx)
+	if uErr != nil {
+		m.log.Warn("user mirror refresh failed", zap.Error(uErr))
+		return u
+	}
+	if orgOp != "" {
+		m.audit.OrgMapped(ctx, orgOp, updated.ID.String(), claims.WorkOSOrgID)
+	}
+	m.recordTermsAssent(ctx, updated)
+	return updated
+}
+
+// recordTermsAssent stores the current published Terms version the first time
+// this user is seen under it. A second request for the same version does not
+// move the timestamp. Failure is logged: a mirror refresh must not fail the
+// request, and the next request tries again.
+func (m *Middleware) recordTermsAssent(ctx context.Context, u *ent.User) {
+	if u == nil {
+		return
+	}
+	internal := WithInternal(ctx)
+	exists, err := m.client.TermsAssent.Query().
+		Where(
+			termsassent.HasUserWith(user.IDEQ(u.ID)),
+			termsassent.TermsVersionEQ(CurrentTermsVersion),
+		).
+		Exist(internal)
+	if err != nil {
+		m.log.Warn("terms assent lookup failed", zap.Error(err))
+		return
+	}
+	if exists {
+		return
+	}
+	err = m.client.TermsAssent.Create().
+		SetUser(u).
+		SetTermsVersion(CurrentTermsVersion).
+		SetAcceptedAt(time.Now().UTC()).
+		Exec(internal)
+	if err != nil && !ent.IsConstraintError(err) {
+		m.log.Warn("terms assent record failed", zap.Error(err))
+	}
+}
+
+// createUser creates the user + free-tier subscription in one transaction.
+// A concurrent first-sight insert loses the unique-index race and falls back
+// to a re-query.
+func (m *Middleware) createUser(ctx context.Context, claims *oauthrs.Claims) (*ent.User, error) {
+	// First-sight provisioning happens before a user can exist in context. Mark
+	// the transaction as an authenticated internal identity operation so the
+	// ORM's tenant-mutation guard permits creation of the new user's subscription.
+	provisionCtx := WithInternal(ctx)
+	email := claims.Email
+	if email == "" && m.enricher != nil {
+		if e, eErr := m.enricher.Email(ctx, claims.WorkOSUserID); eErr == nil {
+			email = e
+		} else {
+			m.log.Debug("workos enrichment failed", zap.Error(eErr))
+		}
+	}
+
+	tx, err := m.client.Tx(provisionCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	create := tx.User.Create().SetWorkosUserID(claims.WorkOSUserID)
+	if email != "" {
+		create = create.SetEmail(email)
+	}
+	if claims.WorkOSOrgID != "" {
+		create = create.SetWorkosOrgID(claims.WorkOSOrgID)
+	}
+	u, err := create.Save(provisionCtx)
+	if err != nil {
+		_ = tx.Rollback()
+		// Lost the first-sight race → the row exists; read it back.
+		if ent.IsConstraintError(err) {
+			return m.client.User.Query().Where(user.WorkosUserIDEQ(claims.WorkOSUserID)).Only(provisionCtx)
+		}
+		return nil, err
+	}
+
+	if _, err := tx.Subscription.Create().
+		SetUser(u).
+		SetSanctionedCredits(m.freeTierCredits).
+		Save(provisionCtx); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("mint free-tier subscription: %w", err)
+	}
+	// The sign-in page says continuing is agreement, and this is the first
+	// verified token. Record the published Terms version at that moment.
+	if err := tx.TermsAssent.Create().
+		SetUser(u).
+		SetTermsVersion(CurrentTermsVersion).
+		SetAcceptedAt(time.Now().UTC()).
+		Exec(provisionCtx); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("record terms assent: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	m.log.Info("user provisioned",
+		zap.String("workos_user_id", claims.WorkOSUserID),
+		zap.String("user_id", u.ID.String()))
+	m.audit.UserUpserted(ctx, "created", u.ID.String(), claims.WorkOSUserID)
+	if claims.WorkOSOrgID != "" {
+		m.audit.OrgMapped(ctx, "set", u.ID.String(), claims.WorkOSOrgID)
+	}
+	return u, nil
+}

@@ -1,0 +1,1090 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/ent"
+	"github.com/PlaybookMediaLLC/oppulence/server/ent/proto/entpb"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/account"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/actions"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentchannels"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentgitops"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentregistry"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agents"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentsessions"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentstream"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentworkflow"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/appconfig"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/auth"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/backgroundtaskruns"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/backgroundtasks"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/backgroundtaskschedule"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/backgroundtaskworkflow"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/billing"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/cloudevents"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/communicationsync"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/composioapi"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/config"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/connectors"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/console"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/crypto"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/db"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/docs"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/email"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/embeddings"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/entities"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/feedback"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/google"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/googleapi"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/gqlapi"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/hubspotapi"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/llm"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/minutes"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/outbound"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/parallel"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/pricing"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/quota"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/ratelimit"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/retention"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/revenue"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/search"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/secrets"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/securitytxt"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/server"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/slack"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/slackclient"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/slacktoken"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/transcription"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/voice"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/voicecloud"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/workosauth"
+	oauthrs "github.com/PlaybookMediaLLC/oppulence/server/oauth-resource-server"
+	"github.com/go-chi/chi/v5"
+	temporalsdk "go.temporal.io/sdk/client"
+	"go.uber.org/zap"
+)
+
+// mountRoutes is the composition root: it constructs shared dependencies and
+// mounts each feature router onto the server. Milestones extend this function.
+func mountRoutes(ctx context.Context, srv *server.Server, cfg appconfig.Config, log *zap.Logger) error {
+	// --- Database -----------------------------------------------------------
+	database, err := db.Open(ctx, cfg, log)
+	if err != nil {
+		return err
+	}
+	srv.AddReadyCheck("database", database.Ping)
+	// Close the connection pool on graceful shutdown (after listeners drain).
+	srv.AddCloser("database", database.Close)
+	client := database.Client
+
+	// gRPC: entproto-generated UserService on cfg.GRPCAddr (:8081).
+	entpb.RegisterUserServiceServer(srv.GRPCServer(), entpb.NewUserService(client))
+
+	// --- Secrets (vendor keys) ---------------------------------------------
+	sec := secrets.NewFromConfig(cfg)
+	if err := sec.LoadInfisical(ctx, cfg); err != nil {
+		// In production with Infisical enabled, a boot-time load failure leaves
+		// the server with no vendor keys while still passing readiness. Fail the
+		// boot instead of silently degrading. In dev (or when Infisical is
+		// disabled) the env-var fallback is expected, so just warn.
+		if cfg.InfisicalEnabled && cfg.IsProduction() {
+			return fmt.Errorf("infisical secret load failed in production: %w", err)
+		}
+		log.Warn("infisical load failed; using env vendor keys", zap.Error(err))
+	}
+	sec.StartRefresh(ctx, cfg, 5*time.Minute, log)
+
+	// --- Pricing ------------------------------------------------------------
+	prices, err := pricing.LoadJSON([]byte(cfg.PricingJSON))
+	if err != nil {
+		return err
+	}
+
+	// --- Column encryption --------------------------------------------------
+	sealer, err := newColumnSealer(cfg)
+	if err != nil {
+		return err
+	}
+
+	// --- Quota + rate limiting ---------------------------------------------
+	gate := quota.New(client, log)
+	rl, err := ratelimit.NewManager(ctx, cfg.RedisURL, cfg.IsProduction(), log)
+	if err != nil {
+		return err
+	}
+
+	// --- Auth ---------------------------------------------------------------
+	// Build the JWT verifier tolerantly: if the JWKS can't be fetched at boot
+	// (e.g. local dev with no IdP), the service still starts and authed routes
+	// return 503 until the IdP is reachable.
+	var verifier *oauthrs.Verifier
+	var allowedJWKSOrigins []string
+	if !cfg.IsProduction() {
+		if u, err := url.Parse(cfg.JWKSURL); err == nil && u.Scheme != "" && u.Host != "" {
+			allowedJWKSOrigins = []string{u.Scheme + "://" + u.Host}
+		}
+	}
+	// Pass the long-lived server ctx (NOT a soon-cancelled one): it drives the
+	// background JWKS refresh goroutine, which must outlive boot so the verifier
+	// can pick up the IdP's rotated signing keys. oauthrs.New bounds its own
+	// boot-time HTTP fetches internally, so this won't hang startup.
+	v, verr := oauthrs.NewGeneric(ctx, oauthrs.GenericConfig{
+		IssuerURL:                   cfg.TokenIssuer,
+		Audience:                    cfg.TokenAudience,
+		SkipAudienceValidation:      cfg.TokenAudience == "",
+		JWKSURL:                     cfg.JWKSURL,
+		AllowedJWKSOrigins:          allowedJWKSOrigins,
+		AcceptableSkew:              60 * time.Second,
+		AllowLocalhostDevelopment:   !cfg.IsProduction(),
+		AllowPrivateJWKSDevelopment: !cfg.IsProduction(),
+	})
+	if verr != nil {
+		log.Warn("auth verifier unavailable; authed routes will return 503 until JWKS is reachable", zap.Error(verr))
+	} else {
+		verifier = v
+	}
+	// The verifier only enforces iss/aud when configured; surface a disabled
+	// check loudly so a deployment that accidentally blanks one doesn't silently
+	// accept tokens minted for a different issuer/audience.
+	if cfg.TokenIssuer == "" {
+		log.Warn("TOKEN_ISSUER is empty: JWT issuer check is DISABLED")
+	}
+	if cfg.TokenAudience == "" {
+		log.Warn("TOKEN_AUDIENCE is empty: JWT audience check is DISABLED (expected for WorkOS-direct tokens)")
+	}
+	enricher := auth.NewWorkOSEnricher(cfg.WorkOSAPIKey, cfg.WorkOSBaseURL)
+	authMW := auth.NewMiddleware(verifier, client, enricher, cfg.FreeTierCredits, log)
+	// RFC 011: classify verified tokens by issuer for audit/metrics + actor kind,
+	// and set the step-up recent-auth window. WorkOS is the human-identity issuer;
+	// the service/broker issuers stay dark until those modes are promoted.
+	authMW.SetIssuerPolicy(auth.IssuerPolicy{
+		WorkOSIssuer:  cfg.TokenIssuer,
+		ServiceIssuer: cfg.ServiceTokenIssuer,
+		BrokerIssuer:  cfg.BrokerTokenIssuer,
+	})
+	authMW.SetStepUpWindow(cfg.StepUpRecentAuthWindow)
+	// Optional readiness signal (RFC 010): report JWKS availability without
+	// failing readiness — the service intentionally boots before the IdP is
+	// reachable and serves 503 on authed routes until then.
+	srv.AddOptionalReadyCheck("workos_jwks", func(context.Context) error {
+		if verifier == nil {
+			return fmt.Errorf("workos jwks not loaded")
+		}
+		return nil
+	})
+
+	// --- Handlers -----------------------------------------------------------
+	configH := config.New(cfg)
+	docsH := docs.New()
+	billingH := billing.New(client, cfg.FreeTierCredits, cfg.DailyCreditLimit, database.Cached, log)
+	billingH.ConfigureStripe(billing.StripeConfig{
+		SecretKey:           cfg.StripeSecretKey,
+		WebhookSecret:       cfg.StripeWebhookSecret,
+		StarterPriceID:      cfg.StripeStarterPriceID,
+		ProPriceID:          cfg.StripeProPriceID,
+		IntelligencePriceID: cfg.StripeIntelligencePriceID,
+		SuccessURL:          cfg.StripeSuccessURL,
+		CancelURL:           cfg.StripeCancelURL,
+		APIBaseURL:          cfg.StripeAPIBaseURL,
+		StarterCredits:      cfg.StripeStarterCredits,
+		ProCredits:          cfg.StripeProCredits,
+		IntelligenceCredits: cfg.StripeIntelligenceCredits,
+	})
+	backgroundTasksH := backgroundtasks.New(client, log)
+	backgroundTasksH.SetAdmission(backgroundtaskruns.AdmissionFromConfig(cfg, gate, prices))
+	// temporalClient outlives this block: the cloud-events route starter below
+	// reuses the same connection. Closed on shutdown by the goroutine.
+	var temporalClient temporalsdk.Client
+	if cfg.TemporalEnabled {
+		temporalClient, err = dialTemporalWithRetry(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		backgroundTasksH.SetTemporal(backgroundtaskworkflow.NewStarter(temporalClient, cfg))
+		if cfg.TemporalSchedulesEnabled {
+			// RFC 005: task create/patch/delete converge a Temporal Schedule
+			// for exact-cron api-target tasks.
+			backgroundTasksH.SetSchedules(&backgroundtaskschedule.Syncer{
+				Client:  client,
+				Manager: backgroundtaskschedule.NewTemporalManager(temporalClient, cfg, log),
+				Cfg:     cfg,
+				Log:     log,
+			})
+		}
+		srv.AddReadyCheck("temporal", func(ctx context.Context) error {
+			_, err := temporalClient.CheckHealth(ctx, nil)
+			return err
+		})
+		go func() {
+			<-ctx.Done()
+			temporalClient.Close()
+		}()
+		// Reconcile the six README product workflows for every tenant. The
+		// definitions are versioned, user pausing is preserved, and unique task
+		// slugs make this safe across all API replicas.
+		go func() {
+			if err := backgroundTasksH.RunFirstPartyProvisioner(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("first-party workflow provisioner stopped", zap.Error(err))
+			}
+		}()
+	}
+	llmH := llm.New(prices, gate, sec, client, log)
+	llmH.SetUpstream(cfg.OpenRouterBaseURL) // empty → provider defaults
+	spendLimits := quota.SpendLimits{Daily: cfg.DailyCreditLimit, Monthly: cfg.MonthlyCreditLimit}
+	vendorPolicy := outbound.Policy{
+		Timeout:               cfg.VendorTimeout,
+		ResponseHeaderTimeout: cfg.VendorResponseHeaderTimeout,
+		MaxConcurrent:         cfg.VendorMaxConcurrent,
+		MaxResponseBytes:      cfg.UpstreamResponseMaxBytes,
+	}
+	llmPolicy := vendorPolicy
+	llmPolicy.MaxConcurrent = cfg.LLMMaxConcurrent
+	llmH.SetOutboundPolicy(llmPolicy)
+	llmH.SetPolicy(llm.Policy{
+		AllowedModels:          cfg.LLMAllowedModels,
+		MaxPromptBytes:         cfg.LLMMaxPromptBytes,
+		MaxToolPayloadBytes:    cfg.LLMMaxToolPayloadBytes,
+		MaxMessages:            cfg.LLMMaxMessages,
+		DefaultMaxOutputTokens: cfg.LLMDefaultMaxOutput,
+		SpendLimits:            spendLimits,
+	})
+	voiceH := voice.New(prices, gate, sec, log)
+	voiceH.SetOutboundPolicy(vendorPolicy)
+	voiceH.SetSpendLimits(spendLimits)
+	searchH := search.New(prices, gate, sec, log)
+	searchH.SetOutboundPolicy(vendorPolicy)
+	searchH.SetSpendLimits(spendLimits)
+
+	// Free cloud meeting-minutes quota (RFC 009 §16). Paid plans are unlimited;
+	// free is metered against FreeMeetingSecondsPerMonth, surfaced to the desktop.
+	meetingAllowance := func(plan string) int {
+		switch plan {
+		case "starter", "pro":
+			return -1 // unlimited cloud meeting minutes
+		default:
+			return cfg.FreeMeetingSecondsPerMonth
+		}
+	}
+	transcriptionH := transcription.New(minutes.New(client, log, meetingAllowance), client, cfg, sec, log)
+	googleH := google.New(client, sealer, sec, log)
+	googleH.SetOutboundPolicy(vendorPolicy)
+	googleH.SetTokenURL(cfg.GoogleTokenURL) // empty → real Google endpoint
+	googleRedirect := cfg.GoogleRedirectURI
+	if googleRedirect == "" {
+		googleRedirect = strings.TrimRight(cfg.AppURL, "/") + "/oauth/google/callback"
+	}
+	googleH.SetOAuthFlow(cfg.GoogleAuthorizeURL, googleRedirect, cfg.DesktopDeepLinkScheme, nil)
+	googleH.SetWebReturnURL(cfg.GoogleWebReturnURL)
+	workosH := workosauth.New(cfg.WorkOSClientID, cfg.WorkOSAPIKey, cfg.WorkOSBaseURL, cfg.WorkOSAuthorizeBaseURL, log)
+	workosH.SetOutboundPolicy(vendorPolicy)
+	voiceCloudH := voicecloud.New(client, log)
+	// Idempotent refresh: WorkOS refresh tokens are rotating/single-use, so
+	// duplicate or replayed refreshes must return the cached rotated bundle
+	// instead of burning the session (see workosauth.SetRefreshDedup).
+	refreshCache := workosauth.NewMemoryRefreshCache()
+	if cfg.RedisURL != "" {
+		if rc, rcErr := workosauth.NewRedisRefreshCache(ctx, cfg.RedisURL); rcErr == nil {
+			refreshCache = rc
+		} else {
+			if cfg.IsProduction() {
+				return fmt.Errorf("configure distributed refresh-token dedup: %w", rcErr)
+			}
+			log.Warn("workos refresh dedup falling back to in-memory cache", zap.Error(rcErr))
+		}
+	}
+	workosH.SetRefreshDedup(refreshCache, sealer)
+	slackH := slack.New(client, sealer, sec, log)
+	slackH.SetOutboundPolicy(vendorPolicy)
+	slackRedirect := cfg.SlackRedirectURI
+	if slackRedirect == "" {
+		slackRedirect = strings.TrimRight(cfg.AppURL, "/") + "/oauth/slack/callback"
+	}
+	slackH.SetOAuthFlow(cfg.SlackAuthorizeURL, cfg.SlackTokenURL, slackRedirect, cfg.DesktopDeepLinkScheme, cfg.SlackOAuthScopes)
+	slackTokens := slacktoken.New(client, sealer, sec, cfg.SlackTokenURL, vendorPolicy)
+	slackAPI := slackclient.New(vendorPolicy)
+	slackH.SetRuntimeClients(slackTokens, slackAPI)
+
+	// Cloud event ingestion (RFC 003). The route controller is wired only when
+	// routing is enabled (it needs Temporal); without it events are stored with
+	// routing_status=skipped.
+	var routeCtl cloudevents.RouteController
+	if cfg.CloudEventsRoutingEnabled && temporalClient != nil {
+		routeCtl = cloudevents.NewRouteStarter(temporalClient, cfg)
+	}
+	cloudEventsH := cloudevents.New(client, sealer, routeCtl, cloudevents.Config{
+		MaxPayloadBytes:      cfg.CloudEventsMaxPayloadBytes,
+		SlackSigningSecret:   cfg.SlackSigningSecret,
+		GoogleWebhookToken:   cfg.GoogleWebhookToken,
+		WebhookSigningSecret: cfg.WebhookSigningSecret,
+	}, log)
+	communicationSync := communicationsync.New(client, sealer, sec, googleapi.New(googleapi.Config{
+		TokenURL:        cfg.GoogleTokenURL,
+		GmailBaseURL:    cfg.GmailAPIBaseURL,
+		CalendarBaseURL: cfg.CalendarAPIBaseURL,
+		DriveBaseURL:    cfg.DriveAPIBaseURL,
+	}), communicationsync.Config{}, log)
+	cloudEventsH.SetGoogleInvalidationConsumer(communicationSync.EnqueueInvalidation)
+	if strings.TrimSpace(cfg.GoogleWebhookOIDCAudience) != "" {
+		googlePushVerifier, err := oauthrs.NewGeneric(ctx, oauthrs.GenericConfig{
+			IssuerURL:      "https://accounts.google.com",
+			Audience:       cfg.GoogleWebhookOIDCAudience,
+			JWKSURL:        "https://www.googleapis.com/oauth2/v3/certs",
+			AcceptableSkew: time.Minute,
+			ValidMethods:   []string{"RS256"},
+		})
+		if err != nil {
+			return fmt.Errorf("configure Google Pub/Sub OIDC verifier: %w", err)
+		}
+		cloudEventsH.SetGooglePushVerifier(googlePushVerifier, cfg.GoogleWebhookOIDCEmail)
+	}
+
+	registry, err := connectors.LoadRegistryForEnvironment([]byte(cfg.ConnectorsJSON), cfg.Environment, cfg.ConnectorEmergencyDisabled)
+	if err != nil {
+		return err
+	}
+	if err := registry.ConfigureProductEntitlementsJSONWithOptions(
+		cfg.ConnectorEntitlementURLsJSON,
+		cfg.ConnectorEntitlementHMACKeysJSON,
+		connectors.ProductEntitlementOptions{AllowLocalDevelopment: cfg.ConnectorAllowLocalEntitlementDevelopment},
+	); err != nil {
+		return fmt.Errorf("configure connector product entitlements: %w", err)
+	}
+	connectorsH := connectors.New(client, sealer, registry, connectors.Config{
+		OryPublicURL:          cfg.OryPublicURL,
+		OryBrokerClientID:     cfg.OryBrokerClientID,
+		OryBrokerClientSecret: cfg.OryBrokerClientSecret,
+		PublicBaseURL:         cfg.PublicBaseURL,
+		DeepLinkScheme:        cfg.DesktopDeepLinkScheme,
+		RedirectAllowlist:     cfg.ConnectorRedirectAllowlist,
+		OAuthLegacyStateWrite: cfg.ConnectorOAuthLegacyStateWrite,
+	}, log)
+	if strings.TrimSpace(cfg.BrokerTokenPrivateKey) != "" {
+		resourceTokenIssuer, issuerErr := connectors.NewRSAResourceTokenIssuer(
+			[]byte(cfg.BrokerTokenPrivateKey),
+			cfg.BrokerTokenKeyID,
+			cfg.BrokerTokenIssuer,
+			cfg.BrokerTokenTTL,
+			[]byte(cfg.BrokerTokenKeyringJSON),
+		)
+		if issuerErr != nil {
+			return fmt.Errorf("configure connector resource-token issuer: %w", issuerErr)
+		}
+		connectorsH.SetResourceTokenIssuer(resourceTokenIssuer)
+	} else if cfg.IsProduction() {
+		return fmt.Errorf("BROKER_TOKEN_PRIVATE_KEY_PEM is required in production")
+	}
+	connectorsH.SetOutboundPolicy(vendorPolicy)
+	connectorsH.SetRefreshDedup(refreshCache, sealer)
+	accountH := account.New(database, billingH, connectorsH, enricher, log)
+	// Email OTP is the fallback factor for accounts with no second factor.
+	// A missing Resend key disables that factor; OAuth re-authentication stays.
+	accountH.SetMailer(email.NewResend(email.ResendConfig{APIKey: cfg.ResendAPIKey, From: cfg.EmailFrom}))
+	srv.AddReadyCheck("connector_credential_custody", connectorsH.CredentialCustodyReady)
+	srv.AddReadyCheck("connector_refresh_failure_persistence", connectorsH.RefreshFailurePersistenceReady)
+	srv.AddShutdownHook("connector_credential_custody", connectorsH.BeginCredentialCustodyShutdown)
+	srv.AddContextCloser("connector_credential_custody", connectorsH.CloseCredentialCustody)
+	go connectorsH.RunRevocationWorker(ctx)
+	go connectorsH.RunCredentialCleanupWorker(ctx)
+	hubspotClient := hubspotapi.New(client, sealer, vendorPolicy)
+	hubspotH := hubspotapi.NewHandler(hubspotClient)
+	composioClient := composioapi.New(cfg.ComposioAPIKey, vendorPolicy)
+	composioH := composioapi.NewHandler(composioClient)
+
+	plainLabels, err := feedback.ParseLabelMap(cfg.PlainLabelTypeIDs)
+	if err != nil {
+		return err
+	}
+	feedbackH := feedback.New(sec, client, feedback.Config{
+		BaseURL:            cfg.PlainAPIURL,
+		LabelTypeIDs:       plainLabels,
+		AlwaysLabelTypeIDs: feedback.ParseLabelList(cfg.PlainAlwaysLabelTypeIDs),
+		TitlePrefix:        cfg.PlainTitlePrefix,
+	}, log)
+	feedbackH.SetOutboundPolicy(vendorPolicy)
+
+	// Durable agent runtime (RFC 027). No master flag — it is active wherever
+	// Temporal is wired (the durable backend it runs on); the full surface
+	// mounts when temporalClient is available. Streaming uses the Redis bus when
+	// configured, else a durable-only poll of the event projection.
+	var agentsH *agents.Handler
+	var agentChannelsH *agentchannels.Handler
+	if temporalClient != nil {
+		agentCatalog := agentregistry.DefaultCatalog()
+		agentLoader, lerr := agentregistry.NewLoader(client, agentCatalog)
+		if lerr != nil {
+			return fmt.Errorf("load agent definitions: %w", lerr)
+		}
+		agentsH = agents.New(client, agentLoader, cfg, log)
+		// One shared starter backs the HTTP handler, channel adapters, and (on the
+		// worker) schedule fires — the single canonical creation path.
+		agentStarter := agentsessions.New(client, agentLoader, agentworkflow.NewStarter(temporalClient, cfg), cfg, log)
+		agentsH.SetStarter(agentStarter)
+		agentsH.SetScheduler(agentworkflow.NewSessionScheduler(temporalClient, cfg))
+		dispatcher := agentchannels.New(client, agentStarter, cfg.AgentDefaultChannelAgent, log)
+		agentChannelsH = agentchannels.NewHandler(client, dispatcher, cfg.SlackSigningSecret, log)
+		// HITL approvals surfaced as Slack buttons resolve back through the shared
+		// starter; the Slack client updates the original message via response_url.
+		agentChannelsH.SetApprovals(agentStarter, slackclient.New(outbound.Policy{
+			Timeout: 15 * time.Second, MaxConcurrent: 64, MaxResponseBytes: 1 << 20,
+		}))
+		cloudEventsH.SetSlackAgentDispatcher(agentChannelsH.DispatchVerifiedSlack)
+		var agentBus *agentstream.Bus
+		if cfg.AgentStreamingEnabled && cfg.RedisURL != "" {
+			if b, berr := agentstream.NewBus(ctx, cfg.RedisURL); berr == nil {
+				agentBus = b
+				go func() { <-ctx.Done(); _ = agentBus.Close() }()
+			} else {
+				log.Warn("agent event bus unavailable; streaming falls back to durable-only poll", zap.Error(berr))
+			}
+		}
+		agentsH.SetStreamer(agentstream.NewStreamer(client, agentBus, log))
+		if cfg.AgentGitOpsEnabled {
+			agentsH.SetGitOps(agentgitops.New(client, agentLoader, agentsH.Policy(), log))
+		}
+	}
+
+	// Revenue memory and outbound governance (RFC 030). Always mounted.
+	// Without a facade base URL the fail-closed disabled facade is used:
+	// observation and drafts work, preflight and sends don't.
+	var facade revenue.FacadeClient
+	if cfg.RevenueFacadeBaseURL != "" {
+		facade = revenue.NewHTTPFacade(revenue.HTTPFacadeConfig{
+			BaseURL:      cfg.RevenueFacadeBaseURL,
+			ServiceToken: cfg.RevenueFacadeServiceToken,
+			Timeout:      cfg.RevenueFacadeTimeout,
+		})
+	}
+	// Approved action execution is routed to the assigned user's connected
+	// provider. Email retains provider-native Gmail drafts; Slack, Calendar,
+	// and HubSpot are send-mode only and remain approval + preflight gated.
+	gmailExec := revenue.NewGmailExecutor(client, sealer, sec, googleapi.New(googleapi.Config{
+		TokenURL:        cfg.GoogleTokenURL,
+		GmailBaseURL:    cfg.GmailAPIBaseURL,
+		CalendarBaseURL: cfg.CalendarAPIBaseURL,
+		DriveBaseURL:    cfg.DriveAPIBaseURL,
+	}))
+	routedExec := revenue.NewRoutingExecutor(
+		gmailExec,
+		revenue.NewSlackExecutor(slackTokens, vendorPolicy),
+		revenue.NewCalendarExecutor(gmailExec),
+		revenue.NewHubSpotExecutor(client, sealer, vendorPolicy),
+	)
+	revenueSvc := revenue.NewService(client, facade, routedExec, log)
+	revenueSvc.SetEvidenceSealer(sealer)
+	// Provider write timeouts are reconciled continuously through read-only
+	// SDK/API lookups. This loop is always on because it is part of exactly-once
+	// execution safety, not an optional recommendation feature.
+	go func() {
+		_ = revenue.NewAmbiguousExecutionReconciler(revenueSvc, time.Minute, 200, log).Run(ctx)
+	}()
+	// Evidence and corrections commit before projection. This leased sweep is
+	// the durable recovery path when the inline projector fails or a temporal
+	// assertion boundary becomes due.
+	go func() {
+		_ = revenue.NewRelationshipProjectionRunner(revenueSvc, 15*time.Second, 200, "", log).Run(ctx)
+	}()
+	// Attention also changes as time passes (for example a commitment becoming
+	// overdue), so event refreshes are backed by an always-on daily sweep.
+	go func() {
+		_ = revenue.NewRelationshipAttentionRunner(revenueSvc, 24*time.Hour, 200, log).Run(ctx)
+	}()
+	// The Gmail backend also feeds the leak scan (read-only sweep).
+	revenueSvc.SetSweeper(gmailExec)
+	// Promise extraction: the model proposes what the deterministic rules miss,
+	// every proposal must quote the message verbatim to survive, and what
+	// survives is a candidate for review rather than a claim. Blank model
+	// disables it and leaves the scan deterministic-only.
+	if extractor := revenue.NewLLMPromiseExtractor(llmH, cfg.RevenuePromiseExtractionModel); extractor != nil {
+		revenueSvc.SetPromiseExtractor(extractor)
+		log.Info("revenue: promise extraction enabled",
+			zap.String("model", cfg.RevenuePromiseExtractionModel))
+	}
+	// Source status rows are the durable backfill queue. Every replica runs the
+	// compare-and-set worker; provider reads emit bounded idempotent observations,
+	// and lifecycle progress advances only after those observations commit.
+	go func() {
+		_ = revenue.NewSourceBackfillRunner(revenueSvc, map[string]revenue.SourceBackfillProvider{
+			"google":  revenue.NewGoogleSourceBackfiller(gmailExec, gmailExec),
+			"slack":   revenue.NewSlackSourceBackfiller(slackTokens, slackAPI),
+			"hubspot": revenue.NewHubSpotSourceBackfiller(hubspotClient),
+		}, 5*time.Second, 50, log).Run(ctx)
+	}()
+	// Gate execution behind a paid plan: scan/queue/draft/ROI stay free,
+	// approve+execute require an active subscription.
+	revenueSvc.SetEntitlements(revenue.NewSubscriptionEntitlements(client))
+	// Layer-3 (RFC 031): on-demand original-email retrieval, cached sealed with
+	// the column key for a short TTL.
+	revenueSvc.SetBodyFetcher(gmailExec, sealer, time.Duration(cfg.MailBodyCacheTTLHours)*time.Hour)
+	revenueSvc.SetAttachmentFetcher(gmailExec)
+	communicationSync.SetProjector(revenueSvc)
+	// Layer-2 (RFC 031): semantic memory. Ships dark behind
+	// REVENUE_SEMANTIC_MEMORY_ENABLED and needs an embeddings key.
+	if cfg.RevenueSemanticMemoryEnabled {
+		revenueSvc.SetEmbedder(embeddings.New(embeddings.Config{
+			APIKey:  sec.OpenAI(),
+			BaseURL: cfg.OpenAIBaseURL,
+			Model:   cfg.EmbeddingsModel,
+		}))
+	}
+	// Cloud research (RFC 039). Always wired; the client is nil without a vendor
+	// key, and every research entry point then reports itself unconfigured. The
+	// key stays here: the desktop never holds it, exactly as with the LLM
+	// gateway. Reaching the vendor additionally needs the cloud_research
+	// capability, the intelligence plan, and workspace consent — all three
+	// checked server-side on every call.
+	revenueSvc.SetResearch(revenue.ResearchConfig{
+		Client: parallel.New(parallel.Config{
+			APIKey:  sec.Parallel(),
+			BaseURL: cfg.ParallelBaseURL,
+			Policy:  vendorPolicy,
+		}),
+		Gate:  gate,
+		Costs: prices.ResearchCosts(),
+		Limits: quota.SpendLimits{
+			Daily: cfg.DailyCreditLimit, Monthly: cfg.MonthlyCreditLimit,
+			OpDaily: cfg.ResearchDailyCreditLimit, OpMonthly: cfg.ResearchMonthlyCreditLimit,
+		},
+	})
+	// The daily account poll that turns the attention queue from a nag list into
+	// a "why now" list. Only ever loads workspaces that have consented, and does
+	// nothing at all without a vendor key.
+	go func() {
+		_ = revenue.NewResearchTriggerRunner(revenueSvc, 24*time.Hour, 200, log).Run(ctx)
+	}()
+	revenueH := revenue.NewHandler(revenueSvc, log)
+	consoleH := console.NewHandler(console.NewService(client, console.WorkspaceResolverFunc(
+		func(ctx context.Context, user *ent.User, workosOrgID string, access console.WorkspaceAccess) (*ent.RevenueWorkspace, error) {
+			workspace, err := revenueSvc.CurrentWorkspaceForOrg(ctx, user, workosOrgID)
+			if err != nil {
+				if ent.IsNotFound(err) || errors.Is(err, revenue.ErrForbidden) {
+					return nil, console.ErrForbidden
+				}
+				return nil, err
+			}
+			capability := revenue.WorkspaceView
+			if access == console.WorkspaceWrite {
+				capability = revenue.WorkspaceContribute
+			}
+			if _, err := revenueSvc.RequireWorkspaceCapability(ctx, user, workspace, capability); err != nil {
+				if errors.Is(err, revenue.ErrForbidden) {
+					return nil, console.ErrForbidden
+				}
+				return nil, err
+			}
+			return workspace, nil
+		},
+	)), log)
+	entitySvc := entities.New(client, func(ctx context.Context) (entities.Scope, error) {
+		u, ok := auth.UserFromCtx(ctx)
+		if !ok {
+			return entities.Scope{}, entities.ErrForbidden
+		}
+		actor, ok := auth.ActorFromCtx(ctx)
+		if !ok || actor.Kind != auth.KindUser || actor.UserID != u.ID || strings.TrimSpace(actor.WorkOSOrgID) == "" {
+			return entities.Scope{}, entities.ErrForbidden
+		}
+		ws, err := revenueSvc.CurrentWorkspaceForOrg(ctx, u, actor.WorkOSOrgID)
+		if err != nil {
+			return entities.Scope{}, entities.ErrForbidden
+		}
+		return entities.Scope{Workspace: ws, User: u}, nil
+	}, func(ctx context.Context, scope entities.Scope, operation entities.Operation) error {
+		actor, ok := auth.ActorFromCtx(ctx)
+		if !ok || actor.Kind != auth.KindUser || actor.UserID != scope.User.ID || actor.WorkOSOrgID == "" || actor.WorkOSOrgID != scope.Workspace.WorkosOrgID {
+			return entities.ErrForbidden
+		}
+		capability := revenue.WorkspaceView
+		if operation == entities.OperationWrite {
+			capability = revenue.WorkspaceContribute
+		}
+		_, err := revenueSvc.RequireWorkspaceCapability(ctx, scope.User, scope.Workspace, capability)
+		return err
+	})
+	entitiesH := entities.NewHandler(entitySvc)
+	// Gmail history synchronization is a required part of the Google source.
+	revenueSvc.SetMailSyncer(gmailExec)
+	// RFC 031: disconnecting Google purges the mail index (Layers 1-3);
+	// Layer-4 evidence quotes survive as the user's own action history.
+	googleH.SetOnDisconnect(func(ctx context.Context, u *ent.User) error {
+		_, purgeErr := revenueSvc.PurgeMailIndex(ctx, u)
+		_, statusErr := revenueSvc.MarkSourceAccountsDisconnected(ctx, u, "google")
+		// Mail-index purge drops threads and bodies. Observations and cloud
+		// events still hold the synced gist and the sealed provider payload.
+		redactErr := retention.RedactSources(ctx, client, u, retention.GoogleSources()...)
+		return errors.Join(purgeErr, statusErr, redactErr)
+	})
+	googleH.SetOnConnect(func(ctx context.Context, u *ent.User, accountEmail string, scopes []string) error {
+		if _, err := revenueSvc.ReportSourceAuthorization(ctx, u, "google", revenue.SourceAuthorizationInput{
+			SourceAccountID: accountEmail,
+			State:           "completed",
+			GrantedScopes:   scopes,
+		}); err != nil {
+			return err
+		}
+		_, err := revenueSvc.BeginSourceBackfill(ctx, u, "google", accountEmail)
+		return err
+	})
+
+	// Closed-loop action broker (RFC 023). Ships dark behind ACTIONS_ENABLED.
+	// The propose→approve→execute→watch surface issues single-use, params-bound
+	// approval tokens; no money-moving action executes without a valid one. The
+	// product Act-seam executor is nil until a product MCP is wired, so execute
+	// fails closed (approve/reject/audit still work).
+	var actionsH *actions.Handler
+	if cfg.ActionsEnabled {
+		actionSigner, err := actions.NewSigner(cfg.AgentSigningSecret())
+		if err != nil {
+			return fmt.Errorf("wire actions broker: %w", err)
+		}
+		// The product Act-seam executor is wired only when configured; without
+		// it execute fails closed (approve/reject/audit still work).
+		var actExec actions.Executor
+		if httpSeam := actions.NewHTTPActSeam(actions.HTTPActSeamConfig{
+			BaseURL:      cfg.ActionActSeamBaseURL,
+			ServiceToken: cfg.ActionActSeamToken,
+			Timeout:      cfg.ActionActSeamTimeout,
+		}); httpSeam != nil {
+			actExec = httpSeam
+		}
+		actionBroker := actions.NewBroker(client, actionSigner, actExec, actions.Config{
+			TokenTTL:                  cfg.ActionTokenTTL,
+			WatchTimeout:              cfg.ActionWatchTimeout,
+			RequireStepUpForFinancial: cfg.ActionRequireStepUpForFinancial,
+		}, log)
+		stepUp := func(r *http.Request) bool {
+			a, ok := auth.ActorFromCtx(r.Context())
+			return ok && authMW.SatisfiesStepUp(a, auth.StepUpRecentAuth)
+		}
+		actionsH = actions.NewHandler(actionBroker, stepUp, log)
+	}
+
+	r := srv.Router()
+
+	// Public (no auth).
+	r.Get("/docs", docsH.Scalar)
+	r.Get("/docs/", docsH.Scalar)
+	r.Get("/openapi.json", docsH.OpenAPI)
+	r.Get("/docs/openapi.json", docsH.OpenAPI)
+	r.Get("/v1/config", configH.Config)
+	// Browser WebSockets cannot set Authorization directly, so the desktop
+	// carries its normal JWT as the second subprotocol. Promote it before the
+	// standard verifier, then proxy the authenticated stream to Deepgram.
+	r.With(
+		transcription.WebSocketBearer,
+		authMW.RequireJWT,
+		rl.PerUser(ratelimit.GroupVoice, 30),
+		rl.PerUserWindow(ratelimit.GroupVoiceBurst, 6, 10*time.Second),
+	).Get("/deepgram/v1/listen", transcriptionH.Listen)
+
+	// WorkOS sign-in broker (public: the caller has no bearer yet; the
+	// credential is the WorkOS code/refresh token + the server-held API key).
+	r.Route("/v1/auth/workos", func(r chi.Router) {
+		r.Use(rl.PerUserWindow(ratelimit.GroupAuth, 30, time.Minute))
+		r.Use(rl.PerUserWindow(ratelimit.GroupAuth+":burst", 5, 10*time.Second))
+		r.Get("/login-url", workosH.LoginURL)
+		r.Post("/exchange", workosH.Exchange)
+		r.Post("/refresh", workosH.Refresh)
+	})
+	// OAuth callback is a browser redirect from Ory (no bearer); the user is
+	// resolved from the sealed pending ticket inside the handler.
+	r.With(rl.PerUserWindow(ratelimit.GroupConnectorCallbacks, 30, time.Minute), rl.PerUserWindow(ratelimit.GroupConnectorCallbacks+":burst", 8, 10*time.Second)).
+		Get("/v1/connections/{name}/callback", connectorsH.Callback)
+	r.With(rl.PerUserWindow(ratelimit.GroupConnectorCallbacks, 30, time.Minute), rl.PerUserWindow(ratelimit.GroupConnectorCallbacks+":burst", 8, 10*time.Second)).
+		Get("/v1/connectors/{name}/callback", connectorsH.Callback)
+	// Product resource servers verify short-lived, audience-bound connector
+	// tokens against this public key set. It contains public key material only.
+	r.Get("/.well-known/connector-jwks.json", connectorsH.BrokerJWKS)
+	r.Get("/.well-known/security.txt", securitytxt.Serve)
+
+	// Provider callbacks are browser-facing and carry state minted by the
+	// authenticated /v1/*-oauth/start endpoints below.
+	r.With(rl.PerUserWindow(ratelimit.GroupAuth, 30, time.Minute)).
+		Get("/oauth/google/callback", googleH.Callback)
+
+	// Slack workspace install front door (browser-facing, no bearer): the
+	// callback parks the sealed bundle for /v1/slack-oauth/claim, which writes
+	// the team_id→user mapping the Slack webhook resolves against.
+	r.With(rl.PerUserWindow(ratelimit.GroupAuth, 30, time.Minute)).
+		Get("/oauth/slack/callback", slackH.Callback)
+
+	// Provider event webhooks (public: providers carry no bearer; each handler
+	// verifies its own credential before ingesting). Pre-auth, so the rate
+	// limit keys on the client IP recovered by RealIPFromTrustedProxies.
+	r.With(rl.PerUserWindow(ratelimit.GroupWebhooks, 240, time.Minute)).
+		Post("/v1/webhooks/google", cloudEventsH.GoogleWebhook)
+	r.With(rl.PerUserWindow(ratelimit.GroupWebhooks, 240, time.Minute)).
+		Post("/v1/webhooks/slack", cloudEventsH.SlackWebhook)
+	r.With(rl.PerUserWindow(ratelimit.GroupWebhooks, 240, time.Minute)).
+		Post("/v1/webhooks/events", cloudEventsH.GenericWebhook)
+	r.With(rl.PerUserWindow(ratelimit.GroupWebhooks, 240, time.Minute)).
+		Post("/v1/billing/stripe/webhook", billingH.StripeWebhook)
+
+	// Agent channel inbound (RFC 027 P5). Slack Events API has a single request
+	// URL, so /v1/webhooks/slack owns verification, durable event storage, and
+	// app_mention fan-out to agentChannelsH. The generic internal ingest lets
+	// any server-side channel gateway start/continue a session.
+	if agentChannelsH != nil {
+		// Slack interactive components (Approve/Deny buttons) for HITL approvals.
+		r.With(rl.PerUserWindow(ratelimit.GroupWebhooks, 240, time.Minute)).
+			Post("/v1/agent-channels/slack/interactivity", agentChannelsH.SlackInteractivity)
+	}
+
+	// Ory pre-consent webhook (shared-secret HMAC, not a user bearer). PostgreSQL
+	// provides one replay reservation namespace shared by every API replica.
+	var hookNonces auth.HookNonceStore = auth.NewMemoryHookNonceStore()
+	if database.Dialect == "postgres" {
+		hookNonces = auth.NewPostgresHookNonceStore(database.SQLDB())
+	}
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireHookHMAC(cfg.HookHMACSecret, hookNonces)).
+		Post("/oauth-hooks/pre-consent", connectorsH.PreConsent)
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireHookHMAC(cfg.HookHMACSecret, hookNonces)).
+		Post("/oauth-hooks/consent-context", connectorsH.ConsentContext)
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireHookHMAC(cfg.HookHMACSecret, hookNonces)).
+		Post("/oauth-hooks/consent-audit", connectorsH.AppendConsentAudit)
+
+	// Product connector invalidation is not part of the global internal-secret
+	// trust domain. Each product/service authenticates as its own HMAC- or
+	// JWT-backed principal and is bounded to configured connector and selector
+	// classes. Global controls require an explicit platform_admin principal.
+	var invalidationJWTVerifier *oauthrs.Verifier
+	if strings.TrimSpace(cfg.ConnectorInvalidationJWTIssuer) != "" {
+		invalidationJWTVerifier, err = oauthrs.NewGeneric(ctx, oauthrs.GenericConfig{
+			IssuerURL:                 cfg.ConnectorInvalidationJWTIssuer,
+			Audience:                  cfg.ConnectorInvalidationJWTAudience,
+			JWKSURL:                   cfg.ConnectorInvalidationJWTJWKSURL,
+			AcceptableSkew:            time.Minute,
+			ValidMethods:              []string{"RS256"},
+			AllowLocalhostDevelopment: !cfg.IsProduction(),
+		})
+		if err != nil {
+			return fmt.Errorf("configure connector invalidation service JWT verifier: %w", err)
+		}
+	}
+	invalidationAuth, err := auth.NewConnectorInvalidationAuth(
+		cfg.ConnectorInvalidationPrincipalsJSON, invalidationJWTVerifier, hookNonces,
+	)
+	if err != nil {
+		return fmt.Errorf("configure connector invalidation principals: %w", err)
+	}
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), invalidationAuth.Require).
+		Post("/v1/internal/connections/invalidate", connectorsH.Invalidate)
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 600, time.Minute), invalidationAuth.RequireConnectionStatus).
+		Post("/v1/internal/connections/status", connectorsH.ConnectionStatus)
+
+	// Other server-to-server APIs retain the separately scoped global internal
+	// capability. Possession of this secret no longer grants product invalidation.
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireInternalSecret(cfg.InternalAPISecret)).
+		Post("/v1/internal/events", cloudEventsH.IngestInternal)
+	if agentChannelsH != nil {
+		r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireInternalSecret(cfg.InternalAPISecret)).
+			Post("/v1/internal/agent-channels/{channel}/inbound", agentChannelsH.InboundInternal)
+	}
+	if agentsH != nil && cfg.AgentGitOpsEnabled {
+		// RFC 028 P4: a git-sync sidecar / CI posts a declared agent set here.
+		r.With(rl.PerUserWindow(ratelimit.GroupInternal, 120, time.Minute), auth.RequireInternalSecret(cfg.InternalAPISecret)).
+			Post("/v1/internal/agent-gitops/reconcile", agentsH.ReconcileGitOps)
+	}
+
+	// Admin GraphQL (entgql + gqlgen) over the full entity graph. Guarded by
+	// the internal secret, which also marks the context internal so the
+	// resolvers' ent queries bypass per-user tenant scoping.
+	r.With(rl.PerUserWindow(ratelimit.GroupInternal, 60, time.Minute), auth.RequireInternalSecret(cfg.InternalAPISecret)).
+		Handle("/graphql", gqlapi.NewHandler(client, gqlapi.HandlerOptions{
+			Introspection: cfg.GraphQLIntrospection,
+			MaxComplexity: cfg.GraphQLMaxComplexity,
+			MaxDepth:      cfg.GraphQLMaxDepth,
+		}))
+
+	// Authenticated surface (Ory/WorkOS bearer required).
+	r.Group(func(r chi.Router) {
+		r.Use(rl.PerUserWindow(ratelimit.GroupRevenue, 60, time.Minute))
+		revenueH.MountPublic(r)
+	})
+
+	r.Group(func(r chi.Router) {
+		r.Use(authMW.RequireJWT)
+		r.Use(rl.PerUser(ratelimit.GroupDefault, 600)) // sanity bucket
+		entitiesH.Mount(r)
+		consoleH.Mount(r)
+
+		r.Get("/v1/me", billingH.Me)
+		r.Get("/v1/me/export", accountH.Export)
+		// Account deletion is irreversible and calls Stripe and WorkOS: a tight
+		// per-user bucket stops a loop or a replay from hammering either vendor.
+		r.With(rl.PerUserWindow(ratelimit.GroupDefault+":account_delete", 5, time.Hour)).Delete("/v1/me", accountH.Delete)
+		// Challenge and verify have their own buckets so a mistyped code does
+		// not consume the deletion budget, and a session cannot mint proofs
+		// without bound.
+		r.With(rl.PerUserWindow(ratelimit.GroupDefault+":account_delete_challenge", 5, time.Hour)).
+			Post("/v1/me/deletion-challenges", accountH.StartDeletionChallenge)
+		r.With(rl.PerUserWindow(ratelimit.GroupDefault+":account_delete_verify", 30, time.Hour)).
+			Post("/v1/me/deletion-challenges/{id}/verify", accountH.VerifyDeletionChallenge)
+		// Shape adapter for the upstream renderer's Better Auth useSession hook.
+		// RequireJWT above remains the sole credential verifier.
+		r.Get("/api/auth/get-session", voiceCloudH.Session)
+		r.Post("/v1/billing/checkout-session", billingH.CheckoutSession)
+		r.Post("/v1/billing/portal-session", billingH.PortalSession)
+		r.Post("/v1/billing/sync", billingH.Sync)
+
+		// Oppulence Voice control plane and opaque encrypted change relay. The
+		// /api/v1 key routes preserve the published capture-client contract while
+		// using WorkOS identity instead of OpenWhispr email-code sessions.
+		r.Route("/api/v1/keys", func(r chi.Router) {
+			r.Post("/create", voiceCloudH.CreateKey)
+			r.Get("/list", voiceCloudH.ListKeys)
+			r.Post("/{id}/revoke", voiceCloudH.RevokeKey)
+		})
+		r.Get("/v1/voice/api-key-verifiers", voiceCloudH.KeyVerifiers)
+		r.Route("/v1/voice-sync", func(r chi.Router) {
+			r.Get("/items", voiceCloudH.ListSyncItems)
+			r.Post("/items", voiceCloudH.PutSyncItem)
+		})
+		r.Post("/v1/capture-artifacts", voiceCloudH.IngestCapture)
+		r.Get("/v1/capture-artifacts/{eventId}", voiceCloudH.GetCapture)
+		// Compatibility alias for released Oppulence Voice export builds.
+		r.Post("/capture-artifacts", voiceCloudH.IngestCapture)
+
+		// Feedback relay to Plain. Tight per-user window: it's a human-driven form.
+		r.With(rl.PerUserWindow(ratelimit.GroupFeedback, 5, time.Minute)).
+			Post("/v1/feedback", feedbackH.Submit)
+
+		r.Get("/v1/background-task-runs", backgroundTasksH.ListAllRuns)
+		r.Route("/v1/background-task-templates", func(r chi.Router) {
+			r.Use(rl.PerUserWindow(ratelimit.GroupTaskBurst, 120, 10*time.Second))
+			r.Get("/", backgroundTasksH.ListTemplates)
+			r.Get("/{templateSlug}", backgroundTasksH.GetTemplate)
+			r.Post("/{templateSlug}/instantiate", backgroundTasksH.InstantiateTemplate)
+		})
+		// NOTE: do not register /v1/background-tasks directly here — the Route
+		// block below registers the same paths WITH the burst limiter, and a
+		// direct registration would (depending on chi's shadowing rules) bypass
+		// it.
+		r.Route("/v1/background-tasks", func(r chi.Router) {
+			// Desktop task runs sync artifacts, run state, events, and UI refreshes
+			// in a short burst; keep the guardrail high enough for normal runs.
+			r.Use(rl.PerUserWindow(ratelimit.GroupTaskBurst, 120, 10*time.Second))
+			r.Get("/", backgroundTasksH.List)
+			r.Post("/", backgroundTasksH.Create)
+			r.Post("/first-party/ensure", backgroundTasksH.EnsureFirstParty)
+			r.Get("/{slug}", backgroundTasksH.Get)
+			r.Patch("/{slug}", backgroundTasksH.Patch)
+			r.Delete("/{slug}", backgroundTasksH.Delete)
+			r.Get("/{slug}/artifact", backgroundTasksH.GetArtifact)
+			r.Put("/{slug}/artifact", backgroundTasksH.PutArtifact)
+			r.Get("/{slug}/runs", backgroundTasksH.ListRuns)
+			r.Post("/{slug}/runs", backgroundTasksH.CreateRun)
+			r.Get("/{slug}/runs/{runId}", backgroundTasksH.GetRun)
+			r.Patch("/{slug}/runs/{runId}", backgroundTasksH.PatchRun)
+			r.Get("/{slug}/runs/{runId}/status", backgroundTasksH.RunStatus)
+			r.Post("/{slug}/runs/{runId}/cancel", backgroundTasksH.CancelRun)
+			r.Post("/{slug}/runs/{runId}/retry", backgroundTasksH.RetryRun)
+			r.Post("/{slug}/runs/{runId}/signal", backgroundTasksH.SignalRun)
+			r.Get("/{slug}/runs/{runId}/events", backgroundTasksH.ListRunEvents)
+			r.Post("/{slug}/runs/{runId}/events", backgroundTasksH.AppendRunEvents)
+			r.Get("/{slug}/runs/{runId}/events/stream", backgroundTasksH.StreamRunEvents)
+			r.Post("/{slug}/trigger", backgroundTasksH.Trigger)
+			r.Get("/{slug}/schedule-state", backgroundTasksH.GetScheduleState)
+		})
+
+		// Durable agent runtime (RFC 027): AgentDefinition CRUD + agent-session
+		// lifecycle. Mounted only when the master flag is on.
+		if agentsH != nil {
+			r.Route("/v1/agents", func(r chi.Router) {
+				r.Use(rl.PerUserWindow(ratelimit.GroupAgent, 60, time.Minute))
+				r.Get("/", agentsH.ListAgents)
+				r.Post("/", agentsH.CreateAgent)
+				// RFC 028: declarative YAML/JSON authoring (one shape, both formats).
+				r.Post("/validate", agentsH.ValidateAgent) // dry-run (CLI/CI)
+				r.Put("/{slug}", agentsH.PutAgent)         // apply (new revision)
+				r.Get("/{slug}", agentsH.GetAgent)         // ?format=yaml round-trips
+				r.Delete("/{slug}", agentsH.DeleteAgent)
+				r.Get("/{slug}/revisions", agentsH.ListRevisions)
+				r.Post("/{slug}/rollback", agentsH.RollbackAgent)
+				// Recurring sessions via Temporal Schedules (P5).
+				r.Post("/{slug}/schedule", agentsH.CreateSchedule)
+				r.Delete("/{slug}/schedule", agentsH.DeleteSchedule)
+			})
+			r.Route("/v1/agent-sessions", func(r chi.Router) {
+				r.Use(rl.PerUserWindow(ratelimit.GroupAgent, 120, time.Minute))
+				r.Get("/", agentsH.ListSessions)
+				r.Post("/", agentsH.CreateSession)
+				r.Get("/{id}", agentsH.GetSession)
+				r.Post("/{id}/turns", agentsH.SubmitTurn)
+				r.Get("/{id}/stream", agentsH.Stream)
+				r.Get("/{id}/events", agentsH.ListEvents)
+				r.With(authMW.RequireStepUp(auth.StepUpRecentAuth)).
+					Post("/{id}/approvals/{approvalId}/token", agentsH.MintApprovalToken)
+				r.Post("/{id}/approvals/{approvalId}", agentsH.Approve)
+				r.Post("/{id}/cancel", agentsH.Cancel)
+			})
+		}
+
+		r.Route("/v1/llm", func(r chi.Router) {
+			// Configurable and generous. The old hardcoded 60/min + 12/10s was
+			// sized for chat-shaped traffic; the desktop is agentic, so one user
+			// action ("label these 15 emails") is ~16 round trips and three of
+			// those run concurrently alongside note tagging and graph builds.
+			// Users hit the ceiling doing exactly what the product asks of them.
+			//
+			// This bounds burst and abuse, not spend: credits are reserved per
+			// call and DAILY_CREDIT_LIMIT / MONTHLY_CREDIT_LIMIT cap cost
+			// independently, and LLM_MAX_CONCURRENT bounds outbound concurrency.
+			r.Use(rl.PerUser(ratelimit.GroupLLM, cfg.LLMRateLimitPerUserPerMin))
+			r.Use(rl.PerUserWindow(ratelimit.GroupLLMBurst, cfg.LLMRateLimitPerUserBurst, 10*time.Second))
+			r.Post("/chat/completions", llmH.ChatCompletions)
+			r.Post("/completions", llmH.Completions)
+			r.Post("/embeddings", llmH.Embeddings)
+			r.Get("/models", llmH.Models)
+		})
+
+		r.Route("/v1/voice", func(r chi.Router) {
+			r.Use(rl.PerUser(ratelimit.GroupVoice, 30))
+			r.Use(rl.PerUserWindow(ratelimit.GroupVoiceBurst, 6, 10*time.Second))
+			r.Post("/text-to-speech/{voiceId}", voiceH.TextToSpeech)
+		})
+
+		// Per-user transcription quota + fleet defaults the desktop reads (RFC 009).
+		r.Get("/v1/transcription/quota", transcriptionH.Quota)
+
+		r.With(rl.PerUser(ratelimit.GroupSearch, 60), rl.PerUserWindow(ratelimit.GroupSearchBurst, 10, 10*time.Second)).
+			Post("/v1/search/exa", searchH.Search)
+
+		r.Route("/v1/google-oauth", func(r chi.Router) {
+			r.Use(rl.PerUserWindow(ratelimit.GroupConnections, 30, time.Minute))
+			r.Get("/", googleH.Status)
+			r.Post("/start", googleH.Start)
+			r.Post("/claim", googleH.Claim)
+			r.Post("/refresh", googleH.Refresh)
+			r.Delete("/", googleH.Disconnect)
+		})
+
+		r.Route("/v1/slack-oauth", func(r chi.Router) {
+			r.Use(rl.PerUserWindow(ratelimit.GroupConnections, 30, time.Minute))
+			r.Post("/start", slackH.Start)
+			r.Post("/claim", slackH.Claim)
+			r.Get("/workspaces", slackH.ListWorkspaces)
+			r.Delete("/workspaces/{teamId}", slackH.DeleteWorkspace)
+			r.Post("/thread/read", slackH.ReadThread)
+			r.Post("/thread/post", slackH.PostThread)
+		})
+
+		// Cloud event ingestion + audit reads (RFC 003).
+		r.Route("/v1/events", func(r chi.Router) {
+			r.Use(rl.PerUserWindow(ratelimit.GroupEvents, 120, time.Minute))
+			r.Post("/", cloudEventsH.Ingest)
+			r.Get("/", cloudEventsH.List)
+			r.Get("/{eventId}", cloudEventsH.Get)
+			r.Get("/{eventId}/runs", cloudEventsH.Runs)
+		})
+
+		// RFC 030 revenue queue. The lifecycle enforces the state-machine
+		// invariants server-side.
+		r.Group(func(r chi.Router) {
+			r.Use(rl.PerUserWindow(ratelimit.GroupRevenue, 120, time.Minute))
+			revenueH.Mount(r)
+		})
+
+		// RFC 023 closed-loop action broker (ships dark behind ACTIONS_ENABLED).
+		if actionsH != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(rl.PerUserWindow(ratelimit.GroupActions, 120, time.Minute))
+				actionsH.Mount(r)
+			})
+		} else {
+			actions.MountDisabled(r)
+		}
+
+		r.With(rl.PerUser(ratelimit.GroupConnections, 30), rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second)).
+			Get("/v1/connectors", connectorsH.List)
+		// Canonical RFC 012 paths. The /v1/connections aliases below remain for
+		// shipped desktop clients and RFC 020 compatibility.
+		r.With(rl.PerUser(ratelimit.GroupConnections, 30), rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second)).
+			Post("/v1/connectors/{name}/start", connectorsH.Start)
+		r.With(rl.PerUser(ratelimit.GroupConnections, 30), rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second)).
+			Post("/v1/connectors/{name}/resource-token", connectorsH.MCPToken)
+		r.With(rl.PerUser(ratelimit.GroupConnections, 30), rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second)).
+			Delete("/v1/connectors/{name}/connections/{connectionID}", connectorsH.Delete)
+		r.With(rl.PerUserWindow(ratelimit.GroupConnections, 60, time.Minute)).
+			Post("/v1/hubspot/search", hubspotH.Search)
+		// The hosted Composio connect flow. Every route reads the user from the
+		// session; the project key can reach every connection in the project.
+		r.Route("/v1/composio", func(r chi.Router) {
+			r.Use(rl.PerUser(ratelimit.GroupConnections, 30))
+			r.Use(rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second))
+			r.Get("/toolkits", composioH.Toolkits)
+			r.Get("/connections", composioH.Connections)
+			r.Post("/connections", composioH.StartConnection)
+			r.Delete("/connections/{connectionID}", composioH.DeleteConnection)
+		})
+		r.Route("/v1/connections", func(r chi.Router) {
+			r.Use(rl.PerUser(ratelimit.GroupConnections, 30))
+			r.Use(rl.PerUserWindow(ratelimit.GroupConnections+":burst", 8, 10*time.Second))
+			r.Post("/{name}/start", connectorsH.Start)
+			r.Post("/{name}/claim", connectorsH.Claim)
+			r.Post("/{name}/api-key", connectorsH.SetAPIKey)
+			r.Post("/{name}/authorization-grant", connectorsH.AuthorizeAPIKeyGrant)
+			r.Post("/{name}/mcp-token", connectorsH.MCPToken)
+			r.Delete("/{name}", connectorsH.Delete)
+		})
+	})
+
+	return nil
+}
+
+// newColumnSealer is kept separate from the full composition root so keyring
+// parsing, legacy compatibility, and fail-closed startup behavior can be tested
+// without opening a database or binding listeners.
+func newColumnSealer(cfg appconfig.Config) (*crypto.Sealer, error) {
+	primaryKeyID, keyring, err := cfg.DBEncryptionKeyring()
+	if err != nil {
+		return nil, fmt.Errorf("column encryption configuration: %w", err)
+	}
+	sealer, err := crypto.NewKeyringSealer(primaryKeyID, keyring)
+	if err != nil {
+		return nil, fmt.Errorf("build column encryption keyring: %w", err)
+	}
+	return sealer, nil
+}
+
+// dialTemporalWithRetry connects to Temporal, retrying for up to ~2 minutes.
+// Temporal regularly comes up after the API in fresh or restarted clusters;
+// exiting on the first failed dial turns that ordering race into a
+// CrashLoopBackOff whose growing delay outlives Temporal's own startup.
+func dialTemporalWithRetry(ctx context.Context, cfg appconfig.Config, log *zap.Logger) (temporalsdk.Client, error) {
+	const (
+		attemptTimeout = 10 * time.Second
+		retryDelay     = 5 * time.Second
+		maxAttempts    = 12
+	)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		tctx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		c, err := backgroundtaskworkflow.Dial(tctx, cfg)
+		cancel()
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		log.Warn("temporal dial failed; retrying",
+			zap.Int("attempt", attempt),
+			zap.Int("max_attempts", maxAttempts),
+			zap.String("address", cfg.TemporalAddress),
+			zap.Error(err),
+		)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	return nil, fmt.Errorf("temporal unreachable after %d attempts: %w", maxAttempts, lastErr)
+}

@@ -1,0 +1,235 @@
+package agentworkflow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agentregistry"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/agenttoken"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/backgroundtaskruntime"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/llm"
+	"go.temporal.io/sdk/temporal"
+)
+
+func newTestActivities() *Activities {
+	return &Activities{Catalog: agentregistry.DefaultCatalog()}
+}
+
+func TestAgentLLMErrorDoesNotRetryCreditFailure(t *testing.T) {
+	err := agentLLMError(&llm.UpstreamStatusError{StatusCode: http.StatusPaymentRequired})
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || !appErr.NonRetryable() || appErr.Type() != "upstream_credits_exhausted" {
+		t.Fatalf("error = %v, want non-retryable upstream_credits_exhausted", err)
+	}
+
+	appErr = nil
+	err = agentLLMError(&llm.UpstreamStatusError{StatusCode: http.StatusBadGateway})
+	if errors.As(err, &appErr) && appErr.NonRetryable() {
+		t.Fatalf("transient upstream failure became non-retryable: %v", err)
+	}
+}
+
+// TestToolInvokeDenyByDefault is the P1 gate: a non-allowlisted tool name
+// ("shell") resolves to ErrToolNotAllowed → Denied, even though it never reaches
+// any tool implementation.
+func TestToolInvokeDenyByDefault(t *testing.T) {
+	a := newTestActivities()
+	res, err := a.ToolInvoke(context.Background(), ToolInvokeInput{
+		UserID: "u", SessionID: "s", ToolName: "shell", AllowedTools: []string{"echo", "current_time"},
+	})
+	if err != nil {
+		t.Fatalf("ToolInvoke returned transport error: %v", err)
+	}
+	if !res.Denied {
+		t.Fatalf("expected shell to be denied, got %+v", res)
+	}
+	if res.ErrorCode == "" {
+		t.Fatal("denied result should carry an error code")
+	}
+}
+
+// TestToolInvokeAllowedRunsTool confirms an allowlisted tool executes and its
+// (truncated) result is returned.
+func TestToolInvokeAllowedRunsTool(t *testing.T) {
+	a := newTestActivities()
+	res, err := a.ToolInvoke(context.Background(), ToolInvokeInput{
+		UserID: "u", SessionID: "s", ToolName: "echo", AllowedTools: []string{"echo"},
+		Args: json.RawMessage(`{"text":"hello-durable-agent"}`),
+	})
+	if err != nil {
+		t.Fatalf("ToolInvoke: %v", err)
+	}
+	if res.Denied || res.Failed {
+		t.Fatalf("expected echo to succeed, got %+v", res)
+	}
+	if !strings.Contains(res.ResultJSON, "hello-durable-agent") {
+		t.Fatalf("echo result missing input: %q", res.ResultJSON)
+	}
+}
+
+func TestToolInvokePassesDurableInvocationIdentity(t *testing.T) {
+	var got backgroundtaskruntime.ToolScope
+	tool := &scopeCaptureTool{got: &got}
+	a := &Activities{Catalog: agentregistry.NewCatalog(agentregistry.Capability{
+		Name: tool.Name(), Build: func(agentregistry.ToolDeps) backgroundtaskruntime.Tool { return tool },
+	})}
+	res, err := a.ToolInvoke(context.Background(), ToolInvokeInput{
+		UserID: "user-1", SessionID: "session-1", TurnSeq: 6, CallIndex: 3,
+		ToolName: tool.Name(), AllowedTools: []string{tool.Name()},
+	})
+	if err != nil || res.Denied || res.Failed {
+		t.Fatalf("ToolInvoke = %+v, %v", res, err)
+	}
+	if got.UserID != "user-1" || got.RunID != "session-1" || got.TurnSeq != 6 || got.ToolCallIndex != 3 {
+		t.Fatalf("tool scope = %+v, want durable invocation identity", got)
+	}
+}
+
+type scopeCaptureTool struct {
+	got *backgroundtaskruntime.ToolScope
+}
+
+func (t *scopeCaptureTool) Name() string                { return "scope.capture" }
+func (t *scopeCaptureTool) Description() string         { return "Capture scope." }
+func (t *scopeCaptureTool) JSONSchema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (t *scopeCaptureTool) Invoke(_ context.Context, scope backgroundtaskruntime.ToolScope, _ json.RawMessage) (json.RawMessage, error) {
+	*t.got = scope
+	return json.RawMessage(`{"ok":true}`), nil
+}
+
+// TestToolInvokeDeniesSubagentPseudoTool confirms the subagent pseudo-tool is
+// never invokable as a normal tool (it has no Build and is excluded from the
+// registry), so the loop must route it to a child workflow instead.
+func TestToolInvokeDeniesSubagentPseudoTool(t *testing.T) {
+	a := newTestActivities()
+	res, _ := a.ToolInvoke(context.Background(), ToolInvokeInput{
+		UserID: "u", SessionID: "s", ToolName: "subagent.delegate", AllowedTools: []string{"subagent.delegate"},
+	})
+	if !res.Denied {
+		t.Fatalf("subagent.delegate should not be invokable as a tool; got %+v", res)
+	}
+}
+
+// TestSessionRequestIDDeterminism is the billing-idempotency anchor target: the
+// same (session, turn, call, attempt) is a stable id (a workflow replay reuses
+// it → no double-charge), while a different attempt is distinct (a Temporal
+// retry reserves fresh).
+func TestSessionRequestIDDeterminism(t *testing.T) {
+	a1 := sessionRequestID("sess-1", 2, 3, 1)
+	a1again := sessionRequestID("sess-1", 2, 3, 1)
+	if a1 != a1again {
+		t.Fatal("same (session,turn,call,attempt) must yield the same request id")
+	}
+	if a1 == sessionRequestID("sess-1", 2, 3, 2) {
+		t.Fatal("a different attempt must yield a different request id (retry reserves fresh)")
+	}
+	if a1 == sessionRequestID("sess-1", 2, 4, 1) {
+		t.Fatal("a different call index must yield a different request id")
+	}
+	if a1 == sessionRequestID("sess-2", 2, 3, 1) {
+		t.Fatal("a different session must yield a different request id")
+	}
+}
+
+// TestValidateApprovalMoneyMoving is the P3 validator gate: money-moving grants
+// fail closed when token verification is unavailable; act-tier grants need none.
+func TestValidateApprovalMoneyMoving(t *testing.T) {
+	a := newTestActivities()
+	ctx := context.Background()
+
+	if err := a.ValidateApproval(ctx, ValidateApprovalInput{TrustTier: agentregistry.TierAct}); err != nil {
+		t.Fatalf("act tier should not require a token: %v", err)
+	}
+	if err := a.ValidateApproval(ctx, ValidateApprovalInput{TrustTier: agentregistry.TierMoneyMoving, ApprovalToken: ""}); err == nil {
+		t.Fatal("money-moving with empty token must be rejected")
+	}
+	if err := a.ValidateApproval(ctx, ValidateApprovalInput{TrustTier: agentregistry.TierMoneyMoving, ApprovalToken: "bogus"}); err == nil {
+		t.Fatal("money-moving with malformed token must be rejected")
+	}
+	if err := a.ValidateApproval(ctx, ValidateApprovalInput{TrustTier: agentregistry.TierMoneyMoving, ApprovalToken: "malformed-token"}); err == nil {
+		t.Fatal("money-moving token must fail closed without a signer")
+	}
+}
+
+// TestValidateApprovalSignedToken is the real RFC-012 gate: with a signer
+// configured, ValidateApproval accepts only a correctly-bound, MFA-asserting,
+// unexpired token — forged, cross-bound, or non-MFA tokens are rejected.
+func TestValidateApprovalSignedToken(t *testing.T) {
+	signer, _ := agenttoken.NewSigner("test-secret-key")
+	a := &Activities{Catalog: agentregistry.DefaultCatalog(), ApprovalSigner: signer, RequireMFA: true}
+	ctx := context.Background()
+	now := time.Now()
+
+	good, _ := signer.MintApproval(agenttoken.ApprovalClaims{
+		ApprovalID: "ap1", UserID: "u1", SessionID: "s1", TrustTier: agentregistry.TierMoneyMoving, MFA: true,
+	}, now, time.Minute)
+	in := ValidateApprovalInput{UserID: "u1", SessionID: "s1", ApprovalID: "ap1", TrustTier: agentregistry.TierMoneyMoving, ApprovalToken: good}
+	if err := a.ValidateApproval(ctx, in); err != nil {
+		t.Fatalf("valid signed money-moving token rejected: %v", err)
+	}
+
+	// Token bound to a DIFFERENT approval must be rejected for this gate.
+	other, _ := signer.MintApproval(agenttoken.ApprovalClaims{
+		ApprovalID: "ap2", UserID: "u1", SessionID: "s1", TrustTier: agentregistry.TierMoneyMoving, MFA: true,
+	}, now, time.Minute)
+	bad := in
+	bad.ApprovalToken = other
+	if err := a.ValidateApproval(ctx, bad); err == nil {
+		t.Fatal("token bound to another approval must be rejected")
+	}
+
+	// Token without MFA must be rejected when MFA is required.
+	noMFA, _ := signer.MintApproval(agenttoken.ApprovalClaims{
+		ApprovalID: "ap1", UserID: "u1", SessionID: "s1", TrustTier: agentregistry.TierMoneyMoving, MFA: false,
+	}, now, time.Minute)
+	nm := in
+	nm.ApprovalToken = noMFA
+	if err := a.ValidateApproval(ctx, nm); err == nil {
+		t.Fatal("non-MFA token must be rejected when MFA is required")
+	}
+
+	// A garbage token is rejected.
+	garbage := in
+	garbage.ApprovalToken = "agt_not-a-real-token"
+	if err := a.ValidateApproval(ctx, garbage); err == nil {
+		t.Fatal("garbage token must be rejected by the signer")
+	}
+}
+
+func TestToolMetasFromCatalogFiltersSubagents(t *testing.T) {
+	c := agentregistry.DefaultCatalog()
+	names := []string{"echo", "subagent.delegate"}
+
+	disabled := ToolMetasFromCatalog(c, names, false)
+	for _, m := range disabled {
+		if m.Kind == agentregistry.KindSubagent {
+			t.Fatal("subagent tools must be dropped when subagents are disabled")
+		}
+	}
+	if len(disabled) != 1 {
+		t.Fatalf("expected 1 tool with subagents disabled, got %d", len(disabled))
+	}
+
+	enabled := ToolMetasFromCatalog(c, names, true)
+	if len(enabled) != 2 {
+		t.Fatalf("expected 2 tools with subagents enabled, got %d", len(enabled))
+	}
+}
+
+// TestRedactArgsKeepsActionDetail confirms secrets are redacted while the
+// human-meaningful action detail (amount, recipient) is preserved for approval.
+func TestRedactArgsKeepsActionDetail(t *testing.T) {
+	raw := json.RawMessage(`{"amount":42,"recipient":"acme","api_key":"sk-secret","token":"xyz"}`)
+	got := redactedMap(raw)
+	if got["amount"] != float64(42) || got["recipient"] != "acme" {
+		t.Fatalf("action detail not preserved: %+v", got)
+	}
+	if got["api_key"] != "[redacted]" || got["token"] != "[redacted]" {
+		t.Fatalf("secrets not redacted: %+v", got)
+	}
+}

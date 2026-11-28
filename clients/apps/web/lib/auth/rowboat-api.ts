@@ -1,0 +1,233 @@
+import "server-only";
+
+import { oppulenceApiURL, oppulenceAuthApiBaseURL, oppulenceAuthApiURL } from "@/lib/auth/config";
+import { decodeUnverifiedWorkOSClaims } from "@/lib/auth/jwt";
+import {
+  OppulenceAPIErrorSchema,
+  ViewerIdentityResponseSchema,
+  ViewerResponseSchema,
+  WorkOSLoginURLResponseSchema,
+  WorkOSTokenBundleSchema,
+  type DashboardSessionCookie,
+  type ViewerIdentityResponse,
+  type ViewerResponse,
+  type WorkOSTokenBundle,
+} from "@/lib/auth/schemas";
+
+async function parseJSON(res: Response): Promise<unknown> {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function oppulenceFetch(url: URL, init: RequestInit): Promise<Response> {
+  return fetch(url, {
+    ...init,
+    cache: "no-store",
+    headers: {
+      Accept: "application/json",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.headers || {}),
+    },
+    signal: init.signal ?? AbortSignal.timeout(15_000),
+  });
+}
+
+async function throwAPIError(res: Response, fallback: string): Promise<never> {
+  const body = await parseJSON(res);
+  const parsed = OppulenceAPIErrorSchema.safeParse(body);
+  const message = parsed.success
+    ? parsed.data.message || parsed.data.error || parsed.data.code || fallback
+    : fallback;
+  throw new Error(message);
+}
+
+const refreshes = new Map<
+  string,
+  { expiresAt: number; promise: Promise<DashboardSessionCookie | null> }
+>();
+
+export async function getWorkOSLoginURL(input: {
+  redirectURI: string;
+  state: string;
+  codeChallenge: string;
+  provider?: string;
+  /** Forces an interactive AuthKit sign-in. Used for account-deletion step-up. */
+  maxAge?: "0";
+  prompt?: "login";
+}): Promise<string> {
+  const url = oppulenceAuthApiURL("/v1/auth/workos/login-url");
+  url.searchParams.set("redirect_uri", input.redirectURI);
+  url.searchParams.set("state", input.state);
+  url.searchParams.set("code_challenge", input.codeChallenge);
+  if (input.provider) {
+    url.searchParams.set("provider", input.provider);
+  }
+  if (input.maxAge === "0") {
+    url.searchParams.set("max_age", "0");
+  }
+  if (input.prompt) {
+    url.searchParams.set("prompt", input.prompt);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw new Error(`Cannot reach the auth API at ${oppulenceAuthApiBaseURL()}.`);
+  }
+  if (!res.ok) {
+    await throwAPIError(res, "could not start WorkOS sign-in");
+  }
+  return WorkOSLoginURLResponseSchema.parse(await parseJSON(res)).url;
+}
+
+export async function exchangeWorkOSCode(input: {
+  code: string;
+  codeVerifier: string;
+}): Promise<WorkOSTokenBundle> {
+  const res = await oppulenceFetch(oppulenceAuthApiURL("/v1/auth/workos/exchange"), {
+    method: "POST",
+    body: JSON.stringify({
+      code: input.code,
+      codeVerifier: input.codeVerifier,
+    }),
+  });
+  if (!res.ok) {
+    await throwAPIError(res, "could not complete WorkOS sign-in");
+  }
+  return WorkOSTokenBundleSchema.parse(await parseJSON(res));
+}
+
+function refreshRequiresReconnect(status: number, body: unknown): boolean {
+  if (status === 400 || status === 401 || status === 403 || status === 409) return true;
+  const parsed = OppulenceAPIErrorSchema.safeParse(body);
+  return parsed.success && parsed.data.code === "reconnect_required";
+}
+
+async function refreshWorkOSSessionOnce(
+  session: DashboardSessionCookie,
+): Promise<DashboardSessionCookie | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let res: Response;
+    try {
+      res = await oppulenceFetch(oppulenceAuthApiURL("/v1/auth/workos/refresh"), {
+        method: "POST",
+        body: JSON.stringify({ refreshToken: session.refreshToken }),
+      });
+    } catch {
+      throw new Error("session refresh is temporarily unavailable");
+    }
+    if (res.ok) {
+      return sessionFromTokenBundle(WorkOSTokenBundleSchema.parse(await parseJSON(res)), session);
+    }
+    const body = await parseJSON(res);
+    if (refreshRequiresReconnect(res.status, body)) return null;
+    if (res.status !== 429 || attempt === 1) {
+      throw new Error("session refresh is temporarily unavailable");
+    }
+    await res.body?.cancel();
+    const seconds = Number(res.headers.get("retry-after"));
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        Number.isFinite(seconds) ? Math.min(Math.max(seconds * 1_000, 0), 5_000) : 1_000,
+      ),
+    );
+  }
+  return null;
+}
+
+/** Coalesces concurrent refreshes so a burst of dashboard requests cannot
+ * race the same rotating WorkOS refresh token. The short reuse window also
+ * covers requests that arrived before the browser stored the refreshed cookie.
+ */
+export function refreshWorkOSSession(
+  session: DashboardSessionCookie,
+): Promise<DashboardSessionCookie | null> {
+  const refreshToken = session.refreshToken;
+  if (!refreshToken) return Promise.resolve(null);
+  const cached = refreshes.get(refreshToken);
+  if (cached && cached.expiresAt > Date.now()) return cached.promise;
+
+  const promise = refreshWorkOSSessionOnce(session);
+  const entry = { expiresAt: Date.now() + 5_000, promise };
+  refreshes.set(refreshToken, entry);
+  setTimeout(() => {
+    if (refreshes.get(refreshToken) === entry) refreshes.delete(refreshToken);
+  }, 5_000);
+  return promise;
+}
+
+export async function fetchViewer(session: DashboardSessionCookie): Promise<ViewerResponse> {
+  const res = await oppulenceFetch(oppulenceApiURL("/v1/me"), {
+    method: "GET",
+    headers: { Authorization: `${session.tokenType} ${session.accessToken}` },
+  });
+  if (!res.ok) {
+    await throwAPIError(res, "could not load viewer");
+  }
+  return ViewerResponseSchema.parse(await parseJSON(res));
+}
+
+export async function fetchViewerIdentity(
+  session: DashboardSessionCookie,
+): Promise<ViewerIdentityResponse> {
+  const res = await oppulenceFetch(oppulenceApiURL("/api/auth/get-session"), {
+    method: "GET",
+    headers: { Authorization: `${session.tokenType} ${session.accessToken}` },
+  });
+  if (!res.ok) {
+    await throwAPIError(res, "could not verify viewer identity");
+  }
+  return ViewerIdentityResponseSchema.parse(await parseJSON(res));
+}
+
+/**
+ * Converts a rowboat-api WorkOS token bundle into the sealed browser session
+ * shape. Token expiry is taken from the broker response; user metadata is read
+ * from the token only as a convenience and is later reconciled with /v1/me.
+ */
+export function sessionFromTokenBundle(
+  bundle: WorkOSTokenBundle,
+  previous?: DashboardSessionCookie,
+): DashboardSessionCookie {
+  const claims = decodeUnverifiedWorkOSClaims(bundle.access_token);
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    version: 1,
+    accessToken: bundle.access_token,
+    refreshToken: bundle.refresh_token || previous?.refreshToken,
+    tokenType: bundle.token_type || "Bearer",
+    expiresAt: claims.exp || bundle.expires_at,
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+    user: {
+      workosUserId: bundle.user_id || claims.sub || previous?.user.workosUserId,
+      email: bundle.email || claims.email || previous?.user.email,
+      sessionId: claims.sid || previous?.user.sessionId,
+      organizationId: claims.org_id || previous?.user.organizationId,
+      role: claims.role || previous?.user.role,
+      permissions: claims.permissions || previous?.user.permissions || [],
+    },
+  };
+}
+
+export function shouldRefreshSession(session: DashboardSessionCookie): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  return session.expiresAt <= now + 60;
+}
+
+/** True while the sealed access token is still within its advertised lifetime. */
+export function sessionAccessValid(session: DashboardSessionCookie): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  return session.expiresAt > now;
+}

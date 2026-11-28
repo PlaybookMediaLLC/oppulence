@@ -1,0 +1,287 @@
+package revenue
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/appconfig"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/auth"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/crypto"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/googleapi"
+	"github.com/PlaybookMediaLLC/oppulence/server/internal/secrets"
+)
+
+// gmailFixture stands up a fake Google (token + Gmail API) and a connected
+// user, returning a ready GmailExecutor wired against them.
+type gmailFixture struct {
+	*fixture
+	exec                 *GmailExecutor
+	gmailSrv             *httptest.Server
+	sent                 int
+	drafted              int
+	calendar             int
+	calendarSendUpdates  string
+	gmailCode            int // response status for gmail calls; 0 = 200
+	gmailFound           bool
+	gmailQuery           string
+	lastMIME             string
+	calendarBody         map[string]any
+	calendarPrivateQuery string
+}
+
+func newGmailFixture(t *testing.T, scopes []string) *gmailFixture {
+	t.Helper()
+	f := newFixture(t)
+	g := &gmailFixture{fixture: f}
+
+	sealer, err := crypto.NewSealer("test-encryption-key-for-revenue")
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	sealed, err := sealer.SealString("1//refresh")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	f.client.OAuthConnection.Create().
+		SetUser(f.user).
+		SetProvider("google").
+		SetRefreshTokenEncrypted(sealed).
+		SetScopes(scopes).
+		SetExternalAccountID("me@gmail.com").
+		SaveX(auth.WithUser(context.Background(), f.user))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "ya29.test"})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/drafts", func(w http.ResponseWriter, r *http.Request) {
+		if g.gmailCode != 0 {
+			w.WriteHeader(g.gmailCode)
+			return
+		}
+		var payload struct {
+			Message struct {
+				Raw string `json:"raw"`
+			} `json:"message"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		decoded, _ := base64.URLEncoding.DecodeString(payload.Message.Raw)
+		g.lastMIME = string(decoded)
+		g.drafted++
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "draft_1", "message": map[string]string{"id": "msg_d1"}})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages/send", func(w http.ResponseWriter, _ *http.Request) {
+		if g.gmailCode != 0 {
+			w.WriteHeader(g.gmailCode)
+			return
+		}
+		g.sent++
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "msg_s1", "threadId": "thr_s1"})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		g.gmailQuery = r.URL.Query().Get("q")
+		messages := []map[string]string{}
+		if g.gmailFound {
+			messages = append(messages, map[string]string{"id": "msg_recovered", "threadId": "thr_recovered"})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"messages": messages})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/threads", func(w http.ResponseWriter, r *http.Request) {
+		g.gmailQuery = r.URL.Query().Get("q")
+		_ = json.NewEncoder(w).Encode(map[string]any{"threads": []any{}})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/messages/msg_recovered", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_recovered", "threadId": "thr_recovered", "payload": map[string]any{"headers": []any{}},
+		})
+	})
+	mux.HandleFunc("/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		g.calendar++
+		g.calendarSendUpdates = r.URL.Query().Get("sendUpdates")
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&g.calendarBody)
+		} else {
+			g.calendarPrivateQuery = r.URL.Query().Get("privateExtendedProperty")
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{
+				"id": "evt_1", "htmlLink": "https://calendar.test/evt_1",
+			}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "evt_1", "htmlLink": "https://calendar.test/evt_1",
+		})
+	})
+	g.gmailSrv = httptest.NewServer(mux)
+	t.Cleanup(g.gmailSrv.Close)
+
+	sec := secrets.NewFromConfig(appconfig.Config{GoogleOAuthClientID: "cid", GoogleOAuthClientSecret: "csec"})
+	g.exec = NewGmailExecutor(f.client, sealer, sec, googleapi.New(googleapi.Config{
+		TokenURL:        g.gmailSrv.URL + "/token",
+		GmailBaseURL:    g.gmailSrv.URL,
+		CalendarBaseURL: g.gmailSrv.URL,
+	}))
+	return g
+}
+
+func (g *gmailFixture) execRequest(t *testing.T, mode string) ExecRequest {
+	t.Helper()
+	action := g.action(t, mode)
+	return ExecRequest{
+		Action:         action,
+		UserID:         g.user.ID,
+		Mode:           mode,
+		IdempotencyKey: ExecutionIdempotencyKey(action.ID.String(), action.Revision),
+	}
+}
+
+func TestGmailExecutorDraft(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailSend})
+	req := g.execRequest(t, ExecModeDraft)
+	res, err := g.exec.Execute(g.ctx, req)
+	if err != nil {
+		t.Fatalf("draft: %v", err)
+	}
+	if res.ProviderMessageID != "draft_1" || g.drafted != 1 || g.sent != 0 {
+		t.Fatalf("draft result=%+v drafted=%d sent=%d", res, g.drafted, g.sent)
+	}
+	if !strings.Contains(g.lastMIME, "Message-ID: "+gmailActionMessageID(req.IdempotencyKey)) {
+		t.Fatalf("draft MIME is missing reconciliation marker: %q", g.lastMIME)
+	}
+}
+
+func TestGmailIncrementalSweepIncludesReplies(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailReadonly})
+	since := time.Unix(1234, 0)
+	if _, _, err := g.exec.SweepThreads(g.ctx, g.user.ID, 90, 10, &since); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if g.gmailQuery != "after:1234" {
+		t.Fatalf("query = %q, want incoming and outgoing mail after cursor", g.gmailQuery)
+	}
+}
+
+func TestGmailExecutorReconcilesByMessageIDWithoutWriting(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailReadonly})
+	g.gmailFound = true
+	req := g.execRequest(t, ExecModeDraft)
+	result, found, err := g.exec.Reconcile(g.ctx, req)
+	if err != nil || !found || result == nil || result.ProviderMessageID != "msg_recovered" || result.ProviderThreadID != "thr_recovered" {
+		t.Fatalf("Gmail reconciliation result=%+v found=%v err=%v", result, found, err)
+	}
+	if g.drafted != 0 || g.sent != 0 {
+		t.Fatalf("Gmail reconciliation must not write: drafted=%d sent=%d", g.drafted, g.sent)
+	}
+	if !strings.Contains(g.gmailQuery, "rfc822msgid:<oppulence-") || !strings.Contains(g.gmailQuery, "@actions.oppulence.ai>") {
+		t.Fatalf("Gmail reconciliation query = %q", g.gmailQuery)
+	}
+}
+
+func TestGmailExecutorSend(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailSend})
+	res, err := g.exec.Execute(g.ctx, g.execRequest(t, ExecModeSend))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if res.ProviderMessageID != "msg_s1" || g.sent != 1 || g.drafted != 0 {
+		t.Fatalf("send result=%+v sent=%d drafted=%d", res, g.sent, g.drafted)
+	}
+}
+
+func TestGmailExecutorMissingScopeIsDefiniteFailure(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose}) // no send scope
+	_, err := g.exec.Execute(g.ctx, g.execRequest(t, ExecModeSend))
+	if err == nil || errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("missing scope must be a definite failure, got %v", err)
+	}
+}
+
+func TestGmailExecutorNoConnectionIsDefiniteFailure(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose})
+	req := g.execRequest(t, ExecModeDraft)
+	// A different (unconnected) user is assigned.
+	other := newUser(t, g.client, "other@x.co", "user_other")
+	req.UserID = other.ID
+	_, err := g.exec.Execute(auth.WithUser(context.Background(), other), req)
+	if err == nil || errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("missing connection must be a definite failure, got %v", err)
+	}
+}
+
+func TestGmailExecutorServerErrorIsAmbiguous(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailSend})
+	g.gmailCode = http.StatusBadGateway
+	_, err := g.exec.Execute(g.ctx, g.execRequest(t, ExecModeSend))
+	if !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("5xx on send must be ambiguous, got %v", err)
+	}
+}
+
+func TestGmailExecutorClientErrorIsDefiniteFailure(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailSend})
+	g.gmailCode = http.StatusForbidden
+	_, err := g.exec.Execute(g.ctx, g.execRequest(t, ExecModeSend))
+	if err == nil || errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("4xx must be a definite failure, got %v", err)
+	}
+}
+
+// End-to-end through the service: an ambiguous Gmail answer lands the action
+// in ambiguous and a retry does not resend (invariant 8 with the real
+// executor in the loop).
+func TestServiceWithGmailExecutorAmbiguous(t *testing.T) {
+	g := newGmailFixture(t, []string{scopeGmailCompose, scopeGmailSend})
+	svc := NewService(g.client, g.facade, g.exec, g.svc.log)
+
+	action := g.action(t, ExecModeDraft)
+	if _, err := svc.Approve(g.ctx, g.user, action.ID, false); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	g.gmailCode = http.StatusServiceUnavailable
+	got, err := svc.Execute(g.ctx, g.user, action.ID)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got.ExecutionStatus != ExecAmbiguous {
+		t.Fatalf("want ambiguous, got %s", got.ExecutionStatus)
+	}
+	g.gmailCode = 0
+	again, err := svc.Execute(g.ctx, g.user, action.ID)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if again.ExecutionStatus != ExecAmbiguous || g.drafted != 0 {
+		t.Fatalf("ambiguous must not auto-resend: status=%s drafted=%d", again.ExecutionStatus, g.drafted)
+	}
+}
+
+var _ Executor = (*GmailExecutor)(nil)
+
+// The two branches differ on purpose, and the difference reads like a bug: a
+// cold scan is anchored to sent mail, an incremental one is not, because
+// replies are inbound and replies are how fulfilment is observed. This pins
+// both so neither can be "fixed" into the other.
+func TestSweepQueryAnchorsTheColdScanAndOpensTheIncrementalOne(t *testing.T) {
+	first := sweepQuery(90, nil)
+	if !strings.Contains(first, "in:sent") {
+		t.Errorf("a cold scan must be anchored to sent mail: %q", first)
+	}
+	if !strings.Contains(first, "newer_than:90d") {
+		t.Errorf("a cold scan lost its lookback window: %q", first)
+	}
+
+	cursor := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	incremental := sweepQuery(90, &cursor)
+	if strings.Contains(incremental, "in:sent") {
+		t.Errorf("an incremental sweep restricted to sent mail cannot see replies: %q", incremental)
+	}
+	if !strings.Contains(incremental, "after:") {
+		t.Errorf("incremental query lost its cursor: %q", incremental)
+	}
+}
