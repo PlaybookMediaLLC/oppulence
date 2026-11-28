@@ -4,7 +4,9 @@ import { Button } from "@oppulence/ui/components/button";
 import { Input } from "@oppulence/ui/components/input";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@oppulence/ui/components/collapsible";
 import { cn } from "@/lib/utils";
-import { McpServerConfig } from "@x/shared/mcp";
+import { sanitizeDisplayText } from "@/lib/sanitize-display";
+import { McpServerConfig, McpServerDefinition } from "@x/shared/mcp";
+import z from "zod";
 import { SettingsSection, SettingsField, KeyValueRows, StringListRows } from "./settings-ui";
 
 /**
@@ -18,7 +20,7 @@ const MCP_PATH = "config/mcp.json";
 
 type ServerKind = "stdio" | "http";
 
-interface EditorServer {
+type EditorServer = {
   /** Stable React key independent of the (editable) name. */
   id: string;
   name: string;
@@ -28,7 +30,8 @@ interface EditorServer {
   env: Record<string, string>;
   url: string;
   headers: Record<string, string>;
-}
+  connectionId?: string;
+};
 
 let idSeq = 0;
 const newId = () => `mcp-${++idSeq}`;
@@ -46,29 +49,53 @@ function blankServer(): EditorServer {
   };
 }
 
-/** Parse the on-disk `{ mcpServers }` map into editor rows. */
-function toEditor(raw: string): EditorServer[] {
-  let parsed: unknown;
+/** Parse the on-disk `{ mcpServers }` map into editor rows with strict Zod validation. */
+function parseToEditor(raw: string): { valid: boolean; servers: EditorServer[] } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { valid: true, servers: [] };
+  let parsedJson: unknown;
   try {
-    parsed = JSON.parse(raw || "{}");
+    parsedJson = JSON.parse(trimmed);
   } catch {
-    return [];
+    return { valid: false, servers: [] };
   }
-  const servers = (parsed as { mcpServers?: Record<string, Record<string, unknown>> })?.mcpServers;
-  if (!servers || typeof servers !== "object") return [];
-  return Object.entries(servers).map(([name, def]) => {
-    const isHttp = def?.type === "http" || (typeof def?.url === "string" && !def?.command);
-    return {
-      id: newId(),
-      name,
-      kind: isHttp ? "http" : "stdio",
-      command: typeof def?.command === "string" ? def.command : "",
-      args: Array.isArray(def?.args) ? (def.args as string[]) : [],
-      env: (def?.env as Record<string, string>) ?? {},
-      url: typeof def?.url === "string" ? def.url : "",
-      headers: (def?.headers as Record<string, string>) ?? {},
-    };
-  });
+  const parsed = McpServerConfig.safeParse(parsedJson);
+  if (!parsed.success) {
+    return { valid: false, servers: [] };
+  }
+  const servers: EditorServer[] = [];
+  for (const [name, rawDef] of Object.entries(parsed.data.mcpServers)) {
+    const defResult = McpServerDefinition.safeParse(rawDef);
+    if (!defResult.success) {
+      return { valid: false, servers: [] };
+    }
+    const def = defResult.data;
+    if ("command" in def) {
+      servers.push({
+        id: newId(),
+        name,
+        kind: "stdio",
+        command: def.command,
+        args: def.args ? [...def.args] : [],
+        env: def.env ? { ...def.env } : {},
+        url: "",
+        headers: {},
+      });
+    } else {
+      servers.push({
+        id: newId(),
+        name,
+        kind: "http",
+        command: "",
+        args: [],
+        env: {},
+        url: def.url,
+        headers: def.headers ? { ...def.headers } : {},
+        connectionId: def.connectionId,
+      });
+    }
+  }
+  return { valid: true, servers };
 }
 
 /** Serialize editor rows back to the `{ mcpServers }` shape, dropping empties. */
@@ -94,6 +121,7 @@ function toConfig(servers: EditorServer[]) {
         type: "http",
         url: s.url,
         ...(Object.keys(headers).length ? { headers } : {}),
+        ...(s.connectionId ? { connectionId: s.connectionId } : {}),
       };
     }
   }
@@ -105,6 +133,7 @@ export function McpSettings({ dialogOpen }: { dialogOpen: boolean }) {
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
   const [jsonOpen, setJsonOpen] = React.useState(false);
   const [rawJson, setRawJson] = React.useState("");
@@ -113,14 +142,32 @@ export function McpSettings({ dialogOpen }: { dialogOpen: boolean }) {
     if (!dialogOpen) return;
     setLoading(true);
     setError(null);
+    setLoadFailed(false);
     setSaved(false);
     window.ipc
       .invoke("workspace:readFile", { path: MCP_PATH })
       .then((r) => {
-        setRawJson(r.data || "");
-        setServers(toEditor(r.data));
+        const raw = r.data || "";
+        setRawJson(raw);
+        const parsed = parseToEditor(raw);
+        if (raw.trim() && !parsed.valid) {
+          setError(
+            "Existing config/mcp.json is invalid — switched to raw JSON so you can repair it.",
+          );
+          setJsonOpen(true);
+          return;
+        }
+        setServers(parsed.servers);
       })
-      .catch(() => setServers([]))
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("ENOENT") || msg.toLowerCase().includes("no such file")) {
+          setServers([]);
+        } else {
+          setLoadFailed(true);
+          setError(`Failed to read config/mcp.json: ${msg}`);
+        }
+      })
       .finally(() => setLoading(false));
   }, [dialogOpen]);
 
@@ -129,10 +176,23 @@ export function McpSettings({ dialogOpen }: { dialogOpen: boolean }) {
 
   // ... (ERRORS.md E45) Seed the raw-JSON view from the current (possibly
   // unsaved) form state when opening it, so it reflects in-progress edits
-  // instead of the last loaded/saved snapshot.
+  // instead of the last loaded/saved snapshot. When closing, parse rawJson
+  // back into form state so edits aren't silently discarded.
   const handleJsonOpenChange = (open: boolean) => {
-    if (open) setRawJson(JSON.stringify(toConfig(servers), null, 2));
-    setJsonOpen(open);
+    if (open) {
+      setError(null);
+      setRawJson(JSON.stringify(toConfig(servers), null, 2));
+      setJsonOpen(true);
+      return;
+    }
+    const parsed = parseToEditor(rawJson);
+    if (!parsed.valid) {
+      setError("Fix invalid MCP JSON configuration before switching back to form view.");
+      return;
+    }
+    setError(null);
+    setServers(parsed.servers);
+    setJsonOpen(false);
   };
 
   const save = async () => {
@@ -157,12 +217,13 @@ export function McpSettings({ dialogOpen }: { dialogOpen: boolean }) {
         }
       }
       const config = jsonOpen ? JSON.parse(rawJson || "{}") : toConfig(servers);
-      // Validate against the shared schema before persisting.
-      McpServerConfig.parse(config);
-      const data = JSON.stringify(config, null, 2);
+      // Validate against the shared schema and persist the parsed output.
+      const parsedConfig = McpServerConfig.parse(config);
+      const data = JSON.stringify(parsedConfig, null, 2);
       await window.ipc.invoke("workspace:writeFile", { path: MCP_PATH, data });
-      if (jsonOpen) setServers(toEditor(data));
+      if (jsonOpen) setServers(parseToEditor(data).servers);
       else setRawJson(data);
+      setLoadFailed(false);
       setSaved(true);
     } catch (e) {
       setError(
@@ -346,7 +407,7 @@ export function McpSettings({ dialogOpen }: { dialogOpen: boolean }) {
             <span className="text-green-600 dark:text-green-400">Saved</span>
           ) : null}
         </span>
-        <Button size="sm" onClick={save} disabled={saving}>
+        <Button size="sm" onClick={save} disabled={saving || (loadFailed && !jsonOpen)}>
           {saving ? "Saving…" : "Save"}
         </Button>
       </div>
@@ -396,7 +457,9 @@ function ServerToolList({ serverName }: { serverName: string }) {
         {busy ? "Connecting…" : tools ? "Refresh tools" : "Show tools"}
       </Button>
 
-      {failure && <p className="mt-2 text-xs text-destructive">{failure}</p>}
+      {failure && (
+        <p className="mt-2 text-xs text-destructive">{sanitizeDisplayText(failure).text}</p>
+      )}
 
       {tools !== null && tools.length === 0 && (
         <p className="mt-2 text-xs text-muted-foreground">
@@ -446,10 +509,11 @@ function ToolRow({
     let parsed: Record<string, unknown>;
     try {
       const value: unknown = JSON.parse(input || "{}");
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      const validated = z.record(z.string(), z.unknown()).safeParse(value);
+      if (!validated.success) {
         throw new Error("Arguments must be a JSON object");
       }
-      parsed = value as Record<string, unknown>;
+      parsed = validated.data;
     } catch (err) {
       // Caught here rather than at the server: a JSON typo should not start a
       // tool call.
@@ -479,9 +543,11 @@ function ToolRow({
     <li className="rounded-none border border-border/60 px-2.5 py-1.5">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="font-mono text-xs">{tool.name}</p>
+          <p className="font-mono text-xs">{sanitizeDisplayText(tool.name).text}</p>
           {tool.description && (
-            <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{tool.description}</p>
+            <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
+              {sanitizeDisplayText(tool.description).text}
+            </p>
           )}
         </div>
         <Button
@@ -502,20 +568,20 @@ function ToolRow({
             rows={3}
             spellCheck={false}
             className="w-full rounded-none border border-border bg-background p-2 font-mono text-xs"
-            aria-label={`Arguments for ${tool.name}`}
+            aria-label={`Arguments for ${sanitizeDisplayText(tool.name).text}`}
           />
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={() => void run()} disabled={busy}>
-              {busy ? "Running…" : `Run ${tool.name}`}
+              {busy ? "Running…" : `Run ${sanitizeDisplayText(tool.name).text}`}
             </Button>
             <span className="text-xs text-muted-foreground">
               Runs for real — this tool can have side effects.
             </span>
           </div>
-          {failure && <p className="text-xs text-destructive">{failure}</p>}
+          {failure && <p className="text-xs text-destructive">{sanitizeDisplayText(failure).text}</p>}
           {output !== null && (
             <pre className="max-h-48 overflow-auto rounded-none border border-border/60 bg-muted/40 p-2 font-mono text-[11px]">
-              {output}
+              {sanitizeDisplayText(output).text}
             </pre>
           )}
         </div>

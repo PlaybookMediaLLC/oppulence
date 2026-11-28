@@ -3,6 +3,7 @@
 import { Button } from "@oppulence/ui/components/button";
 import { Textarea } from "@oppulence/ui/components/textarea";
 import { cn } from "@/lib/utils";
+import { sanitizeDisplayText } from "@/lib/sanitize-display";
 import { MessageCircleIcon, ArrowUpIcon } from "@/lib/icons";
 import type { ComponentProps } from "react";
 import { useState, useRef, useEffect } from "react";
@@ -25,6 +26,12 @@ export const AskHumanRequest = ({
   const [response, setResponse] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const hasOptions = Array.isArray(options) && options.length > 0;
+  const sanitizedQuery = sanitizeDisplayText(query);
+  const sanitizedOptions = Array.isArray(options)
+    ? options.map((opt) => ({ raw: opt, safe: sanitizeDisplayText(opt) }))
+    : [];
+  const hasHiddenChars =
+    sanitizedQuery.hasHiddenChars || sanitizedOptions.some((o) => o.safe.hasHiddenChars);
 
   useEffect(() => {
     // Auto-focus the textarea when in free-text mode; nothing to focus for buttons.
@@ -72,21 +79,26 @@ export const AskHumanRequest = ({
                 Question from Agent
               </h3>
               <p className="text-sm text-foreground whitespace-pre-wrap">
-                {query}
+                {sanitizedQuery.text}
               </p>
+              {hasHiddenChars && (
+                <p className="mt-1.5 text-xs text-destructive">
+                  Warning: Contains hidden or bidirectional Unicode characters (escaped as [U+XXXX]).
+                </p>
+              )}
             </div>
             {hasOptions ? (
               <div className="flex flex-wrap gap-2">
-                {options!.map((option) => (
+                {sanitizedOptions.map(({ raw, safe }) => (
                   <Button
-                    key={option}
+                    key={raw}
                     variant="outline"
                     size="sm"
-                    onClick={() => handleOptionClick(option)}
+                    onClick={() => handleOptionClick(raw)}
                     disabled={isProcessing}
                     className="bg-background"
                   >
-                    {option}
+                    {safe.text}
                   </Button>
                 ))}
               </div>

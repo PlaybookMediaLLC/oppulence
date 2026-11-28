@@ -44,12 +44,13 @@ function resolveWorkDir(): string {
 export const WorkDir = resolveWorkDir();
 
 function ensureDirs() {
-  const ensure = (p: string) => {
-    if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+  const ensure = (p: string, mode?: number) => {
+    if (!fs.existsSync(p))
+      fs.mkdirSync(p, mode !== undefined ? { recursive: true, mode } : { recursive: true });
   };
   ensure(WorkDir);
   ensure(path.join(WorkDir, "agents"));
-  ensure(path.join(WorkDir, "config"));
+  ensure(path.join(WorkDir, "config"), 0o700);
   ensure(path.join(WorkDir, "knowledge"));
 }
 

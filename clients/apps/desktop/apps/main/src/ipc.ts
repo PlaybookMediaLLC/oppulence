@@ -38,6 +38,22 @@ import { MACOS_SYSTEM_SETTINGS_PROTOCOLS, openTrustedExternal } from "./external
 
 const execAsync = promisify(exec);
 import { RunEvent } from "@x/shared/runs";
+import {
+  canonicalizePath,
+  getMcpServerAllowList,
+  isPathInsideDir,
+  isProtectedWorkspacePath,
+  isSensitiveOrBroadExternalGrantPrefix,
+} from "@x/core/config/security";
+import {
+  assertAllowedRendererWorkspaceRelPath,
+  formatMcpSpawnDialogDetail,
+  getShellOpenBlockReason,
+  isBlockedWindowsShellPath,
+  sanitizeNativeDialogText,
+  validateRendererConfigWriteContent,
+  type RendererWorkspaceOperation,
+} from "./ipc-workspace-security.js";
 import { ServiceEvent } from "@x/shared/service-events";
 import container from "@x/core/di/container";
 import { listOnboardingModels } from "@x/core/models/models-dev";
@@ -329,6 +345,67 @@ function resolveShellPath(filePath: string): string {
   }
 
   return workspace.resolveWorkspacePath(filePath);
+}
+
+async function assertAllowedRendererWorkspacePath(
+  relPath: string,
+  operation: RendererWorkspaceOperation = "read",
+): Promise<string> {
+  assertAllowedRendererWorkspaceRelPath(relPath, operation);
+  const absTarget = workspace.resolveWorkspacePath(relPath);
+  const canonicalRoot = await canonicalizePath(WorkDir);
+  const canonicalTarget = await canonicalizePath(absTarget);
+  if (!isPathInsideDir(canonicalRoot, canonicalTarget)) {
+    throw new Error(`Path "${relPath}" resolves outside workspace boundary.`);
+  }
+  const canonicalRel = path.relative(canonicalRoot, canonicalTarget).replace(/\\/g, "/");
+  return assertAllowedRendererWorkspaceRelPath(canonicalRel, operation);
+}
+
+function validateRendererConfigWrite(normalizedCanonicalRelPath: string, data: string): boolean {
+  return validateRendererConfigWriteContent(normalizedCanonicalRelPath, data, {
+    isSensitiveOrBroadExternalGrantPrefix: (prefix) =>
+      isSensitiveOrBroadExternalGrantPrefix(prefix),
+    isProtectedWorkspacePath: (targetPath, operation) =>
+      isProtectedWorkspacePath(targetPath, operation),
+  });
+}
+
+async function resolveRendererMcpSpawnPolicy(
+  event: Electron.IpcMainInvokeEvent,
+  serverName: string,
+): Promise<mcpCore.McpSpawnPolicy> {
+  const requirement = await mcpCore.getStdioMcpSpawnRequirement(serverName);
+  if (!requirement) {
+    return { kind: "remote-only" };
+  }
+  const persistentApproved = getMcpServerAllowList().some(
+    (grant) =>
+      grant.serverName === requirement.serverName
+      && grant.configDigest === requirement.configDigest,
+  );
+  if (requirement.alreadyConnectedWithSameConfig || persistentApproved) {
+    return { kind: "stdio", expectedDigest: requirement.configDigest };
+  }
+
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const safeServerName = sanitizeNativeDialogText(requirement.serverName);
+  const dialogOptions: Electron.MessageBoxOptions = {
+    type: "warning",
+    buttons: ["Cancel", "Allow & Run"],
+    defaultId: 0,
+    cancelId: 0,
+    title: "Confirm Local MCP Server Execution",
+    message: `Allow running local MCP server "${safeServerName}"?`,
+    detail: formatMcpSpawnDialogDetail(requirement),
+  };
+  const { response } = win
+    ? await dialog.showMessageBox(win, dialogOptions)
+    : await dialog.showMessageBox(dialogOptions);
+  if (response !== 1) {
+    throw new Error(`User declined to spawn local MCP server "${requirement.serverName}".`);
+  }
+  return { kind: "stdio", expectedDigest: requirement.configDigest };
 }
 
 type InvokeChannels = ipc.InvokeChannels;
@@ -1189,30 +1266,46 @@ export function setupIpcHandlers() {
       return workspace.getRoot();
     },
     "workspace:exists": async (_, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "read");
       return workspace.exists(args.path);
     },
     "workspace:stat": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "read");
       return workspace.stat(args.path);
     },
     "workspace:readdir": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "read");
       return workspace.readdir(args.path, args.opts);
     },
     "workspace:readFile": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "read");
       return workspace.readFile(args.path, args.encoding);
     },
     "workspace:writeFile": async (_event, args) => {
-      return workspace.writeFile(args.path, args.data, args.opts);
+      const normalizedRelPath = await assertAllowedRendererWorkspacePath(args.path, "write");
+      const isMcpConfig = validateRendererConfigWrite(normalizedRelPath, args.data);
+      const res = await workspace.writeFile(args.path, args.data, args.opts);
+      if (isMcpConfig) {
+        await mcpCore.cleanup();
+      }
+      return res;
     },
     "workspace:mkdir": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "write");
       return workspace.mkdir(args.path, args.recursive);
     },
     "workspace:rename": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.from, "mutate-structure");
+      await assertAllowedRendererWorkspacePath(args.to, "mutate-structure");
       return workspace.rename(args.from, args.to, args.overwrite);
     },
     "workspace:copy": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.from, "read");
+      await assertAllowedRendererWorkspacePath(args.to, "mutate-structure");
       return workspace.copy(args.from, args.to, args.overwrite);
     },
     "workspace:remove": async (_event, args) => {
+      await assertAllowedRendererWorkspacePath(args.path, "mutate-structure");
       return workspace.remove(args.path, args.opts);
     },
     "gmail:getImportant": async (_event, args) => {
@@ -1247,11 +1340,17 @@ export function setupIpcHandlers() {
       saveMessageBodyHeight(args.threadId, args.messageId, args.height);
       return {};
     },
-    "mcp:listTools": async (_event, args) => {
-      return mcpCore.listTools(args.serverName, args.cursor);
+    "mcp:listTools": async (event, args) => {
+      const spawnPolicy = await resolveRendererMcpSpawnPolicy(event, args.serverName);
+      return mcpCore.listTools(args.serverName, args.cursor, { spawnPolicy });
     },
-    "mcp:executeTool": async (_event, args) => {
-      return { result: await mcpCore.executeTool(args.serverName, args.toolName, args.input) };
+    "mcp:executeTool": async (event, args) => {
+      const spawnPolicy = await resolveRendererMcpSpawnPolicy(event, args.serverName);
+      return {
+        result: await mcpCore.executeTool(args.serverName, args.toolName, args.input, {
+          spawnPolicy,
+        }),
+      };
     },
     "runs:create": async (_event, args) => {
       return runsCore.createRun(args);
@@ -1592,8 +1691,20 @@ export function setupIpcHandlers() {
     },
     // Shell integration handlers
     "shell:openPath": async (_event, args) => {
+      if (isBlockedWindowsShellPath(args.path)) {
+        throw new Error("Refusing to open Windows device, UNC, ADS, or trailing-dot path");
+      }
       const filePath = resolveShellPath(args.path);
-      const error = await shell.openPath(filePath);
+      const canonical = await canonicalizePath(filePath);
+      if (isProtectedWorkspacePath(canonical, "read")) {
+        throw new Error("Refusing to open protected workspace path");
+      }
+      const stat = await fs.stat(canonical).catch(() => null);
+      const blockReason = getShellOpenBlockReason(args.path, canonical, stat);
+      if (blockReason) {
+        throw new Error(blockReason);
+      }
+      const error = await shell.openPath(canonical);
       return { error: error || undefined };
     },
     "shell:showItemInFolder": async (_event, args) => {
@@ -1602,13 +1713,26 @@ export function setupIpcHandlers() {
       return { success: true };
     },
     "shell:readFileBase64": async (_event, args) => {
+      if (isBlockedWindowsShellPath(args.path)) {
+        throw new Error("Refusing to read Windows device, UNC, ADS, or trailing-dot path");
+      }
       const filePath = resolveShellPath(args.path);
-      const stat = await fs.stat(filePath);
+      const canonical = await canonicalizePath(filePath);
+      if (
+        isProtectedWorkspacePath(canonical, "read")
+        || isSensitiveOrBroadExternalGrantPrefix(canonical)
+      ) {
+        throw new Error("Refusing to read protected or sensitive file via shell:readFileBase64");
+      }
+      const stat = await fs.stat(canonical);
+      if (!stat.isFile()) {
+        throw new Error("Refusing to read non-regular file via shell:readFileBase64");
+      }
       if (stat.size > 10 * 1024 * 1024) {
         throw new Error("File too large (>10MB)");
       }
-      const buffer = await fs.readFile(filePath);
-      const ext = path.extname(filePath).toLowerCase();
+      const buffer = await fs.readFile(canonical);
+      const ext = path.extname(canonical).toLowerCase();
       const mimeMap: Record<string, string> = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -1661,6 +1785,16 @@ export function setupIpcHandlers() {
     // Search handler
     "search:query": async (_event, args) => {
       return search(args.query, args.limit, args.types);
+    },
+    "search:isExaConfigured": async () => {
+      try {
+        const exaPath = path.join(WorkDir, "config", "exa-search.json");
+        const raw = await fs.readFile(exaPath, "utf8");
+        const parsed = z.object({ apiKey: z.string().trim().min(1) }).safeParse(JSON.parse(raw));
+        return { configured: parsed.success };
+      } catch {
+        return { configured: false };
+      }
     },
     // Semantic memory handlers (RFC 021)
     "memory:search": async (_event, args) => {

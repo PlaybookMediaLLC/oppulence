@@ -121,8 +121,15 @@ function scanDirectoryRecursive(dir: string): string[] {
     const entries = fs.readdirSync(dir);
     for (const entry of entries) {
         if (entry.startsWith('.')) continue;
+        if (entry.toLowerCase() === 'agent notes') continue;
         const fullPath = path.join(dir, entry);
-        const stat = fs.statSync(fullPath);
+        let stat: fs.Stats;
+        try {
+            stat = fs.lstatSync(fullPath);
+        } catch {
+            continue;
+        }
+        if (stat.isSymbolicLink()) continue;
         if (stat.isDirectory()) {
             files.push(...scanDirectoryRecursive(fullPath));
         } else if (stat.isFile() && entry.endsWith('.md')) {

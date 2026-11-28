@@ -670,18 +670,8 @@ function ChatInputInner({
       }
       let available = false;
       try {
-        const exists = await window.ipc.invoke("workspace:exists", {
-          path: "config/exa-search.json",
-        });
-        if (!exists.exists) {
-          setSearchAvailable(false);
-          return;
-        }
-        const raw = await window.ipc.invoke("workspace:readFile", {
-          path: "config/exa-search.json",
-        });
-        const config = JSON.parse(raw.data);
-        if (config.apiKey) available = true;
+        const res = await window.ipc.invoke("search:isExaConfigured", null);
+        available = res.configured;
       } catch {
         /* not configured */
       }

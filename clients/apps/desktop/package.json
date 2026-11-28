@@ -13,7 +13,7 @@
     "main": "wait-on http://localhost:5173 && cd apps/main && npm run build && npm run start",
     "start:dogfood": "cd apps/main && npm run start:dogfood",
     "test": "npm run shared && npm run test:architecture-contracts && npm run test:graph-cache && npm run test:meeting-readiness && npm run test:user-facing-errors && npm run test:service-error-copy && npm run test:preview-text && npm run test:billing-flow && npm run test:account-deletion && npm run test:session-reconnect && npm run test:desktop-dictation && npm run test:product-tour && cd packages/core && npm test",
-    "test:architecture-contracts": "node --experimental-strip-types --test tests/external-url.test.ts tests/ipc-security.test.ts tests/renderer-events.test.ts",
+    "test:architecture-contracts": "node --experimental-strip-types --test tests/external-url.test.ts tests/ipc-security.test.ts tests/ipc-workspace-security.test.ts tests/renderer-events.test.ts tests/sanitize-display.test.ts",
     "test:graph-cache": "node --experimental-strip-types --test tests/knowledge-graph-cache.test.ts",
     "test:meeting-readiness": "node --experimental-strip-types --test tests/meeting-readiness.test.ts",
     "test:user-facing-errors": "node --experimental-strip-types --test tests/user-facing-error.test.ts",

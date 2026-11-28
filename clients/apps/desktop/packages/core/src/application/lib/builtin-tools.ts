@@ -1,21 +1,40 @@
 import { z, ZodType } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { executeCommand, executeCommandAbortable } from "./command-executor.js";
+import { executeCommand, executeCommandAbortable, resolveCommandWorkingDir } from "./command-executor.js";
 import { resolveSkill, availableSkills } from "../assistant/skills/index.js";
 import { closeMcpClient, executeTool, listServers, listTools } from "../../mcp/mcp.js";
 import container from "../../di/container.js";
-import { IMcpConfigRepo } from "../..//mcp/repo.js";
-import { McpServerDefinition } from "@x/shared/mcp";
+import { IMcpConfigRepo } from "../../mcp/repo.js";
+import { McpServerDefinition, McpServerName } from "@x/shared/mcp";
 import * as files from "../../filesystem/files.js";
 import { IAgentsRepo } from "../../agents/repo.js";
 import { WorkDir } from "../../config/config.js";
+import { isPathInsideDir, isProtectedWorkspacePath } from "../../config/security.js";
 import { BrowserControlInputSchema, type BrowserControlInput } from "@x/shared/browser-control";
 import { BackgroundTaskSchema, TriggersSchema } from "@x/shared/background-task";
 import type { CodeModeManager } from "../../code-mode/acp/manager.js";
 import type { CodePermissionRegistry } from "../../code-mode/acp/permission-registry.js";
 import { ICodeModeConfigRepo } from "../../code-mode/repo.js";
 import type { ApprovalPolicy } from "@x/shared/code-mode";
+
+// Tools excluded from all headless/background agents (live-note, background-task,
+// inline-task) because they execute arbitrary code/shells, configure MCP servers,
+// mutate scheduled tasks/memory, expose server config, or recursively spawn agents.
+export const HEADLESS_EXCLUDED_TOOLS: ReadonlySet<string> = new Set([
+    'executeCommand',
+    'code_agent_run',
+    'addMcpServer',
+    'listMcpServers',
+    'create-background-task',
+    'patch-background-task',
+    'run-background-task-agent',
+    'run-live-note-agent',
+    'analyzeAgent',
+    'save-to-memory',
+    'rowboat-configure-integration-mcp',
+    'browser-control',
+]);
 
 // Inputs for the bg-task builtin tools. Reuse the canonical schema field
 // descriptions; only `triggers` gets a tighter contextual override (the
@@ -668,7 +687,7 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
     addMcpServer: {
         description: 'Add or update an MCP server in the configuration with validation. This ensures the server definition is valid before saving.',
         inputSchema: z.object({
-            serverName: z.string().describe('Name/alias for the MCP server'),
+            serverName: McpServerName.describe('Name/alias for the MCP server'),
             config: McpServerDefinition,
         }),
         execute: async ({ serverName, config }: { 
@@ -676,6 +695,15 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
             config: z.infer<typeof McpServerDefinition>;
         }) => {
             try {
+                const nameResult = McpServerName.safeParse(serverName);
+                if (!nameResult.success) {
+                    return {
+                        success: false,
+                        message: 'Server name failed validation.',
+                        validationErrors: nameResult.error.issues.map((e) => `${e.path.join('.') || 'serverName'}: ${e.message}`),
+                    };
+                }
+
                 const validationResult = McpServerDefinition.safeParse(config);
                 if (!validationResult.success) {
                     return {
@@ -687,11 +715,12 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
                 }
 
                 const repo = container.resolve<IMcpConfigRepo>('mcpConfigRepo');
-                await repo.upsert(serverName, config);
-                
+                await repo.upsert(nameResult.data, validationResult.data);
+                await closeMcpClient(nameResult.data);
+
                 return {
                     success: true,
-                    serverName,
+                    serverName: nameResult.data,
                 };
             } catch (error) {
                 return {
@@ -706,11 +735,39 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
         inputSchema: z.object({}),
         execute: async () => {
             try {
-                const result = await listServers();
-                
+                const rawResult = await listServers();
+                const redactedServers: Record<string, unknown> = {};
+                for (const [name, entry] of Object.entries(rawResult.mcpServers)) {
+                    const cfg = entry.config;
+                    if ('command' in cfg) {
+                        const redactedEnv = cfg.env
+                            ? Object.fromEntries(Object.keys(cfg.env).map((k) => [k, '[REDACTED]']))
+                            : undefined;
+                        redactedServers[name] = {
+                            ...entry,
+                            config: {
+                                ...cfg,
+                                ...(redactedEnv ? { env: redactedEnv } : {}),
+                            },
+                        };
+                    } else {
+                        const redactedHeaders = cfg.headers
+                            ? Object.fromEntries(Object.keys(cfg.headers).map((k) => [k, '[REDACTED]']))
+                            : undefined;
+                        redactedServers[name] = {
+                            ...entry,
+                            config: {
+                                ...cfg,
+                                ...(redactedHeaders ? { headers: redactedHeaders } : {}),
+                            },
+                        };
+                    }
+                }
+                const result = { mcpServers: redactedServers };
+
                 return {
                     result,
-                    count: Object.keys(result.mcpServers).length,
+                    count: Object.keys(redactedServers).length,
                 };
             } catch (error) {
                 return {
@@ -726,9 +783,11 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
             serverName: z.string().describe('Name of the MCP server to query'),
             cursor: z.string().optional(),
         }),
-        execute: async ({ serverName, cursor }: { serverName: string, cursor?: string }) => {
+        execute: async ({ serverName, cursor }: { serverName: string, cursor?: string }, ctx?: ToolContext) => {
             try {
-                const result = await listTools(serverName, cursor);
+                const result = await listTools(serverName, cursor, {
+                    spawnPolicy: ctx?.mcpSpawnPolicy,
+                });
                 return {
                     serverName,
                     result,
@@ -749,9 +808,11 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
             toolName: z.string().describe('Name of the tool to execute'),
             arguments: z.record(z.string(), z.any()).optional().describe('Arguments to pass to the tool (as key-value pairs matching the tool\'s input schema). MUST include all required parameters from the tool\'s inputSchema.'),
         }),
-        execute: async ({ serverName, toolName, arguments: args = {} }: { serverName: string, toolName: string, arguments?: Record<string, unknown> }) => {
+        execute: async ({ serverName, toolName, arguments: args = {} }: { serverName: string, toolName: string, arguments?: Record<string, unknown> }, ctx?: ToolContext) => {
             try {
-                const result = await executeTool(serverName, toolName, args);
+                const result = await executeTool(serverName, toolName, args, {
+                    spawnPolicy: ctx?.mcpSpawnPolicy,
+                });
                 return {
                     success: true,
                     serverName,
@@ -777,8 +838,7 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
         }),
         execute: async ({ command, cwd }: { command: string, cwd?: string }, ctx?: ToolContext) => {
             try {
-                const rootDir = path.resolve(WorkDir);
-                const workingDir = cwd ? path.resolve(rootDir, cwd) : rootDir;
+                const workingDir = resolveCommandWorkingDir(cwd);
 
                 // TODO: Re-enable this check
                 // const rootPrefix = rootDir.endsWith(path.sep)
@@ -805,7 +865,7 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
                                 toolCallId: ctx.toolCallId,
                                 toolName: "executeCommand",
                                 output: chunk,
-                                subflow: [],
+                                subflow: ctx.subflow ?? [],
                             });
                         },
                     });
@@ -877,6 +937,12 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
                 return { success: false, message: 'Code Mode settings are unavailable. Cannot run code_agent_run.' };
             }
 
+            // Canonicalize `cwd` identically to runtime.ts's permission check so a
+            // relative path or symlink cannot diverge between check time and spawn time.
+            const rawCwd = cwd.trim() || '.';
+            const resolvedCwd = await files.resolveFilePathForPermission(rawCwd);
+            const canonicalCwd = resolvedCwd.canonicalPath;
+
             // On stop, unblock any pending approval card so the broker stops waiting for
             // an answer that will never come. The ACP cancel + force-kill backstop that
             // actually ends the turn is handled inside manager.runPrompt via the signal
@@ -887,11 +953,12 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
 
             let finalText = '';
             const changedFiles = new Set<string>();
+            const subflow = ctx.subflow ?? [];
             try {
                 const result = await manager.runPrompt({
                     runId: ctx.runId,
                     agent: effectiveAgent,
-                    cwd,
+                    cwd: canonicalCwd,
                     prompt,
                     policy,
                     signal: ctx.signal,
@@ -903,7 +970,7 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
                             type: 'code-run-event',
                             toolCallId: ctx.toolCallId,
                             event,
-                            subflow: [],
+                            subflow,
                         });
                     },
                     ask: (permAsk) => registry.request(ctx.runId, (requestId) => {
@@ -913,7 +980,7 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
                             toolCallId: ctx.toolCallId,
                             requestId,
                             ask: permAsk,
-                            subflow: [],
+                            subflow,
                         });
                     }),
                 });
@@ -1085,13 +1152,29 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
         }) => {
             switch (input.action) {
                 case 'open-note': {
-                    const filePath = input.path as string;
+                    const filePath = typeof input.path === 'string' ? input.path.trim() : '';
+                    if (!filePath || !filePath.toLowerCase().endsWith('.md')) {
+                        return { success: false, error: 'open-note requires a markdown (.md) path inside knowledge/' };
+                    }
                     try {
-                        const result = await files.exists(filePath);
-                        if (!result.exists) {
-                            return { success: false, error: `File not found: ${filePath}` };
+                        const knowledgeDir = await fs.realpath(path.join(WorkDir, 'knowledge')).catch(() => path.resolve(WorkDir, 'knowledge'));
+                        const resolved = path.isAbsolute(filePath)
+                            ? path.resolve(filePath)
+                            : path.resolve(WorkDir, filePath);
+                        const canonical = await fs.realpath(resolved).catch(() => null);
+                        if (
+                            !canonical
+                            || !isPathInsideDir(knowledgeDir, canonical)
+                            || isProtectedWorkspacePath(canonical, 'read')
+                        ) {
+                            return { success: false, error: `Note not found inside knowledge/: ${filePath}` };
                         }
-                        return { success: true, action: 'open-note', path: filePath };
+                        const stat = await fs.stat(canonical);
+                        if (!stat.isFile()) {
+                            return { success: false, error: `Note not found inside knowledge/: ${filePath}` };
+                        }
+                        const normalizedRel = path.relative(knowledgeDir, canonical).split(path.sep).join('/');
+                        return { success: true, action: 'open-note', path: `knowledge/${normalizedRel}` };
                     } catch {
                         return { success: false, error: `Could not access file: ${filePath}` };
                     }
@@ -1317,14 +1400,25 @@ export const BuiltinTools: z.infer<typeof BuiltinToolsSchema> = {
             note: z.string().describe("The observation or preference to remember. Be specific and concise."),
         }),
         execute: async ({ note }: { note: string }) => {
-            const inboxPath = path.join(WorkDir, 'knowledge', 'Agent Notes', 'inbox.md');
-            const dir = path.dirname(inboxPath);
-            await fs.mkdir(dir, { recursive: true });
+            const notesDir = path.join(WorkDir, 'knowledge', 'Agent Notes');
+            const inboxPath = path.join(notesDir, 'inbox.md');
+            await fs.mkdir(notesDir, { recursive: true });
+
+            const canonicalWorkDir = await fs.realpath(WorkDir).catch(() => path.resolve(WorkDir));
+            const canonicalNotesDir = await fs.realpath(notesDir);
+            const expectedNotesDir = path.join(canonicalWorkDir, 'knowledge', 'Agent Notes');
+            if (!isPathInsideDir(expectedNotesDir, canonicalNotesDir)) {
+                throw new Error('Agent Notes directory resolves outside workspace boundary');
+            }
+            const inboxStat = await fs.lstat(inboxPath).catch(() => null);
+            if (inboxStat?.isSymbolicLink()) {
+                throw new Error('Refusing to append to Agent Notes inbox through symbolic link');
+            }
 
             const timestamp = new Date().toISOString();
             const entry = `\n- [${timestamp}] ${note}\n`;
 
-            await fs.appendFile(inboxPath, entry, 'utf-8');
+            await fs.appendFile(path.join(canonicalNotesDir, 'inbox.md'), entry, 'utf-8');
 
             return {
                 success: true,

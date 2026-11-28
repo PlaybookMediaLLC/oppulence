@@ -1036,15 +1036,31 @@ async function processThread(
     for (const msg of messages) {
       const msgId = msg.id!;
       const headers = msg.payload?.headers || [];
-      const from = headers.find((h) => h.name === "From")?.value || "Unknown";
-      const date = headers.find((h) => h.name === "Date")?.value || "Unknown";
+      const from = (headers.find((h) => h.name === "From")?.value || "Unknown")
+        .replace(/[\r\n]+/g, " ")
+        .trim();
+      const date = (headers.find((h) => h.name === "Date")?.value || "Unknown")
+        .replace(/[\r\n]+/g, " ")
+        .trim();
+      const isVerifiedSent = Array.isArray(msg.labelIds) && msg.labelIds.includes("SENT");
 
       mdContent += `### From: ${from}\n`;
-      mdContent += `**Date:** ${date}\n\n`;
+      mdContent += `**Date:** ${date}\n`;
+      if (isVerifiedSent) {
+        mdContent += `**Verified Sender:** SENT\n`;
+      }
+      mdContent += "\n";
 
       if (msg.payload) {
-        const body = getBody(msg.payload);
-        mdContent += `${body}\n\n`;
+        const rawBody = getBody(msg.payload);
+        // Neutralize attacker-controlled body lines that mimic thread separators
+        // or message metadata headers so downstream parsers (e.g. agent_notes.ts)
+        // cannot be spoofed into treating external email content as user-sent.
+        const safeBody = rawBody.replace(
+          /^(---\s*$|###\s+From:|\*\*Verified Sender:\*\*)/gim,
+          "> $1",
+        );
+        mdContent += `${safeBody}\n\n`;
       }
 
       // Attachments

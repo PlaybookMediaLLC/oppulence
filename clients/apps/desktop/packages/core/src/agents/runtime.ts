@@ -1,6 +1,7 @@
 import { jsonSchema, ModelMessage } from "ai";
 import { withPromptCaching } from "./prompt-caching.js";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { WorkDir } from "../config/config.js";
 import { Agent, ToolAttachment } from "@x/shared/agent";
@@ -17,7 +18,13 @@ import {
 import { LanguageModel, stepCountIs, streamText, tool, Tool, ToolSet } from "ai";
 import { z } from "zod";
 import { LlmStepStreamEvent } from "@x/shared/llm-step-events";
-import { execTool } from "../application/lib/exec-tool.js";
+import {
+  computeStdioMcpConfigDigest,
+  execTool,
+  getStdioMcpSpawnRequirement,
+  type McpSpawnPolicy,
+} from "../application/lib/exec-tool.js";
+import { McpServerDefinition, McpServerName } from "@x/shared/mcp";
 import {
   AskHumanRequestEvent,
   RunEvent,
@@ -28,9 +35,20 @@ import { BuiltinTools } from "../application/lib/builtin-tools.js";
 import { buildCopilotAgent } from "../application/assistant/agent.js";
 import { buildLiveNoteAgent } from "../knowledge/live-note/agent.js";
 import { buildBackgroundTaskAgent } from "../background-tasks/agent.js";
-import { isBlocked, extractCommandNames } from "../application/lib/command-executor.js";
+import {
+  evaluateCommandSecurity,
+  extractCommandNames,
+  isAlwaysRequireApprovalCommand,
+  resolveCommandWorkingDir,
+} from "../application/lib/command-executor.js";
 import {
   getFileAccessAllowList,
+  getMcpServerAllowList,
+  isSameNormalizedPath,
+  isAgentNotesWorkspacePath,
+  isPathInsideDir,
+  isProtectedWorkspacePath,
+  isSensitiveOrBroadExternalGrantPrefix,
   type FileAccessGrant,
   type FileAccessOperation,
 } from "../config/security.js";
@@ -59,8 +77,129 @@ import {
   classifyToolPermissions,
   type AutoPermissionCandidate,
 } from "../security/auto-permission-classifier.js";
+import { splitFrontmatter } from "../application/lib/parse-frontmatter.js";
+import { isCloudMetadataHostOrIp, isPrivateOrLocalIpAddress } from "../security/network-safety.js";
 
 const AGENT_NOTES_DIR = path.join(WorkDir, "knowledge", "Agent Notes");
+
+const DANGEROUS_MCP_ENV_VARS = new Set([
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "ELECTRON_RUN_AS_NODE",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_AUDIT",
+  "GLIBC_TUNABLES",
+  "GCONV_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "PATH",
+  "PATHEXT",
+  "COMSPEC",
+  "SHELL",
+  "HOME",
+  "BASH_ENV",
+  "ENV",
+  "ZDOTDIR",
+  "PROMPT_COMMAND",
+  "FPATH",
+  "EDITOR",
+  "VISUAL",
+  "BROWSER",
+  "PAGER",
+  "PYTHONSTARTUP",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PIP_INDEX_URL",
+  "PIP_EXTRA_INDEX_URL",
+  "PIP_CONFIG_FILE",
+  "PIP_FIND_LINKS",
+  "UV_INDEX_URL",
+  "UV_EXTRA_INDEX_URL",
+  "UV_DEFAULT_INDEX",
+  "UV_PYTHON",
+  "NPM_CONFIG_SCRIPT_SHELL",
+  "RUBYOPT",
+  "RUBYLIB",
+  "PERL5OPT",
+  "PERL5LIB",
+  "PERL5DB",
+  "PERLLIB",
+  "JAVA_TOOL_OPTIONS",
+  "_JAVA_OPTIONS",
+  "JDK_JAVA_OPTIONS",
+  "CLASSPATH",
+  "DOTNET_STARTUP_HOOKS",
+  "CORECLR_PROFILER",
+  "CORECLR_ENABLE_PROFILING",
+  "GOFLAGS",
+  "RUSTC_WRAPPER",
+  "PHP_INI_SCAN_DIR",
+  "PHPRC",
+  "LUA_INIT",
+  "GIT_SSH_COMMAND",
+  "GIT_EXEC_PATH",
+  "IFS",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "REQUESTS_CA_BUNDLE",
+  "CURL_CA_BUNDLE",
+  "AWS_CA_BUNDLE",
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "SSH_ASKPASS",
+  "SUDO_ASKPASS",
+  "OPENSSL_CONF",
+  "OPENSSL_ENGINES",
+  "OPENSSL_MODULES",
+  "GOENV",
+  "GOPROXY",
+  "GOPATH",
+  "GOBIN",
+  "PSMODULEPATH",
+  "LUA_PATH",
+  "LUA_CPATH",
+]);
+
+const DANGEROUS_MCP_ENV_PREFIXES = [
+  "LD_",
+  "DYLD_",
+  "NPM_CONFIG_",
+  "NODE_",
+  "PYTHON",
+  "PIP_",
+  "UV_",
+  "GIT_",
+  "JAVA_",
+  "_JAVA_",
+  "JDK_",
+  "DOTNET_",
+  "CORECLR_",
+  "CARGO_",
+  "RUSTC_",
+  "XDG_",
+  "CURL_",
+  "SSH_",
+  "BUNDLE_",
+  "GEM_",
+  "PHP_",
+  "ELECTRON_",
+  "LUA_INIT_",
+] as const;
+
+function isDangerousMcpEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  if (DANGEROUS_MCP_ENV_VARS.has(upper)) {
+    return true;
+  }
+  return DANGEROUS_MCP_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix));
+}
 
 // Work directory is scoped per run (per chat). Each run gets its own sidecar
 // config file so setting it in one chat does not leak into others.
@@ -71,10 +210,7 @@ function workDirConfigFile(runId: string): string {
 type ToolPermissionMetadataValue = z.infer<typeof ToolPermissionMetadata>;
 
 function isPathInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return (
-    relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
-  );
+  return isPathInsideDir(parent, child);
 }
 
 function fileGrantCoversPath(
@@ -88,9 +224,21 @@ function fileGrantCoversPath(
   );
 }
 
-function commonPathPrefix(paths: string[]): string {
+function commonPathPrefix(paths: readonly string[]): string {
   if (!paths.length) return path.resolve(WorkDir);
-  const split = paths.map((p) => path.resolve(p).split(path.sep).filter(Boolean));
+  const resolvedPaths = paths.map((p) => path.resolve(p));
+  const roots = resolvedPaths.map((p) => path.parse(p).root);
+  const firstRoot = roots[0];
+  if (!roots.every((r) => r.toLowerCase() === firstRoot.toLowerCase())) {
+    // Disjoint filesystem roots (e.g. C:\ and D:\) — cannot safely coalesce
+    return firstRoot;
+  }
+  const split = resolvedPaths.map((p) =>
+    p
+      .slice(firstRoot.length)
+      .split(/[\\/]+/)
+      .filter(Boolean),
+  );
   const first = split[0];
   const common: string[] = [];
   for (let i = 0; i < first.length; i++) {
@@ -100,11 +248,10 @@ function commonPathPrefix(paths: string[]): string {
       break;
     }
   }
-  const prefix = `${path.sep}${common.join(path.sep)}`;
-  return prefix === path.sep ? prefix : path.resolve(prefix);
+  return common.length === 0 ? firstRoot : path.resolve(firstRoot, ...common);
 }
 
-function grantPrefixForTool(toolName: string, resolvedPaths: string[]): string {
+function grantPrefixForTool(toolName: string, resolvedPaths: readonly string[]): string {
   if (
     toolName === "file-list" ||
     toolName === "file-glob" ||
@@ -117,10 +264,171 @@ function grantPrefixForTool(toolName: string, resolvedPaths: string[]): string {
   return commonPathPrefix(parentPaths);
 }
 
+const PROTECTED_TOP_DIR_NAMES = [
+  "config",
+  "runs",
+  ".trash",
+  "code-mode",
+  "runtime",
+  "models",
+  "cache",
+  "index",
+  "events",
+  "logs",
+  ".git",
+] as const;
+
+function firstSegmentCouldMatchProtectedDir(segment: string): boolean {
+  const lower = segment.toLowerCase();
+  if (!lower || lower === "*" || lower === "**") return false;
+  if (!/[*?[]/.test(lower)) return false;
+  // Convert basic glob segment into regex to detect patterns like `config*`, `con?ig`, `[c]onfig`
+  const escaped = lower
+    .replace(/[.+^${}()|\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  try {
+    const re = new RegExp(`^${escaped}$`, "i");
+    return PROTECTED_TOP_DIR_NAMES.some((dir) => re.test(dir));
+  } catch {
+    return true;
+  }
+}
+
+function extractGlobTargetInfo(
+  baseDir: string,
+  globPattern: string,
+): { targetPath: string | null; forceSingleApproval: boolean } {
+  const trimmed = globPattern.trim();
+  if (!trimmed) return { targetPath: null, forceSingleApproval: false };
+  const normalizedSlash = trimmed.replace(/\\/g, "/");
+  const globIndex = normalizedSlash.search(/[*?[{]/);
+  // Slice static directory prefix strictly before the wildcard segment (up to last `/`)
+  let staticDirPrefix: string;
+  if (globIndex === -1) {
+    staticDirPrefix = normalizedSlash;
+  } else {
+    const beforeGlob = normalizedSlash.slice(0, globIndex);
+    const lastSlash = beforeGlob.lastIndexOf("/");
+    staticDirPrefix = lastSlash === -1 ? "" : beforeGlob.slice(0, lastSlash);
+  }
+  const normalizedPrefix = staticDirPrefix.replace(/\/+$/, "");
+
+  // Brace expansion (`{/etc/passwd,x}`, `{..,x}/.ssh/*`) can expand to arbitrary
+  // absolute or traversal paths — always require explicit per-call approval.
+  if (normalizedSlash.includes("{") || normalizedSlash.includes("}")) {
+    return {
+      targetPath: path.resolve(baseDir),
+      forceSingleApproval: true,
+    };
+  }
+
+  // Check `..` traversal components BEFORE absolute-path handling so patterns
+  // like `<WorkDir>/knowledge/*/../../config/oauth.json` or `/abs/*/../etc/*`
+  // always require explicit per-call approval.
+  const isAbsoluteOrHome =
+    normalizedSlash.startsWith("/") ||
+    normalizedSlash.startsWith("~") ||
+    /^[A-Za-z]:/.test(normalizedSlash) ||
+    trimmed.startsWith("\\\\");
+
+  if (normalizedSlash.split("/").includes("..")) {
+    if (isAbsoluteOrHome) {
+      const fallbackRoot = normalizedSlash.startsWith("~")
+        ? "~"
+        : /^[A-Za-z]:/.test(normalizedSlash)
+          ? normalizedSlash.slice(0, 2) + "/"
+          : "/";
+      return {
+        targetPath: normalizedPrefix || fallbackRoot,
+        forceSingleApproval: true,
+      };
+    }
+    const dotDotCount = normalizedSlash.split("/").filter((seg) => seg === "..").length;
+    const traversalTarget =
+      globIndex === -1 || normalizedPrefix.split("/").includes("..")
+        ? path.join(baseDir, normalizedPrefix || "..")
+        : path.join(baseDir, ...Array<string>(dotDotCount).fill(".."));
+    return { targetPath: traversalTarget, forceSingleApproval: true };
+  }
+
+  if (isAbsoluteOrHome) {
+    const fallbackRoot = normalizedSlash.startsWith("~")
+      ? "~"
+      : /^[A-Za-z]:/.test(normalizedSlash)
+        ? normalizedSlash.slice(0, 2) + "/"
+        : "/";
+    const candidateTarget = normalizedPrefix || fallbackRoot;
+    const hasWildcard = globIndex !== -1;
+    // An absolute wildcard rooted at WorkDir itself (e.g. `<WorkDir>/**/*`) or at a
+    // filesystem/home root could reach protected subtrees — require single approval.
+    const resolvedCandidate =
+      candidateTarget === "~"
+        ? os.homedir()
+        : candidateTarget.startsWith("~/")
+          ? path.join(os.homedir(), candidateTarget.slice(2))
+          : path.resolve(candidateTarget);
+    const rootsAtWorkspace = isSameNormalizedPath(resolvedCandidate, WorkDir);
+    return {
+      targetPath: candidateTarget,
+      forceSingleApproval: hasWildcard && (rootsAtWorkspace || !normalizedPrefix),
+    };
+  }
+
+  // Case-insensitive detection of protected workspace subtrees (stripping repeated `./`)
+  const strippedRel = normalizedSlash.replace(/^(?:\.\/)+/, "");
+  const segments = strippedRel.split("/").filter(Boolean);
+  const firstSegment = segments[0] ?? "";
+  if (
+    /^(?:config|runs|\.trash|code-mode|runtime|models|cache|index|events|logs|\.git)(?:\/|$)/i.test(
+      strippedRel,
+    ) ||
+    firstSegmentCouldMatchProtectedDir(firstSegment)
+  ) {
+    const cleanedPrefix = normalizedPrefix.replace(/^(?:\.\/)+/, "");
+    return {
+      targetPath: path.join(baseDir, cleanedPrefix || firstSegment || "config"),
+      forceSingleApproval: true,
+    };
+  }
+
+  // Any nested `.git` segment (e.g. `knowledge/.git/config`) must be gated.
+  if (segments.some((seg) => seg.toLowerCase() === ".git")) {
+    const cleanedPrefix = normalizedPrefix.replace(/^(?:\.\/)+/, "");
+    return {
+      targetPath: path.join(baseDir, cleanedPrefix || strippedRel),
+      forceSingleApproval: true,
+    };
+  }
+
+  // Whenever there is a static directory prefix before the wildcard (e.g.
+  // `knowledge/link_to_config/oauth.json` or `knowledge/*.md`), return it so
+  // `getToolPermissionMetadata` canonicalizes it through symlinks and checks
+  // workspace and protected boundaries.
+  const cleanedPrefix = normalizedPrefix.replace(/^(?:\.\/)+/, "");
+  if (cleanedPrefix) {
+    return {
+      targetPath: path.join(baseDir, cleanedPrefix),
+      forceSingleApproval: false,
+    };
+  }
+
+  return { targetPath: null, forceSingleApproval: false };
+}
+
+type FilePermissionTargetEntry = {
+  readonly path: string;
+  readonly operation: FileAccessOperation;
+};
+
 function filePermissionTargets(
   toolName: string,
   args: Record<string, unknown>,
-): { operation: FileAccessOperation; paths: string[] } | null {
+): {
+  primaryOperation: FileAccessOperation;
+  entries: FilePermissionTargetEntry[];
+  forceSingleApproval?: boolean;
+} | null {
   const pathArg = typeof args.path === "string" ? args.path : undefined;
   switch (toolName) {
     case "file-readText":
@@ -128,95 +436,706 @@ function filePermissionTargets(
     case "LLMParse":
     case "file-exists":
     case "file-stat":
-      return pathArg ? { operation: "read", paths: [pathArg] } : null;
+      return pathArg
+        ? { primaryOperation: "read", entries: [{ path: pathArg, operation: "read" }] }
+        : null;
     case "file-list":
-      return pathArg ? { operation: "list", paths: [pathArg || "."] } : null;
-    case "file-glob":
       return {
-        operation: "search",
-        paths: [typeof args.cwd === "string" && args.cwd ? args.cwd : "."],
+        primaryOperation: "list",
+        entries: [{ path: pathArg && pathArg.trim() ? pathArg : ".", operation: "list" }],
       };
-    case "file-grep":
+    case "file-glob": {
+      const cwd = typeof args.cwd === "string" && args.cwd ? args.cwd : ".";
+      const entries: FilePermissionTargetEntry[] = [{ path: cwd, operation: "search" }];
+      let forceSingleApproval = false;
+      if (typeof args.pattern === "string") {
+        const extra = extractGlobTargetInfo(cwd, args.pattern);
+        if (extra.targetPath) entries.push({ path: extra.targetPath, operation: "search" });
+        if (extra.forceSingleApproval) forceSingleApproval = true;
+      }
       return {
-        operation: "search",
-        paths: [typeof args.searchPath === "string" && args.searchPath ? args.searchPath : "."],
+        primaryOperation: "search",
+        entries,
+        forceSingleApproval,
       };
+    }
+    case "file-grep": {
+      const searchPath =
+        typeof args.searchPath === "string" && args.searchPath ? args.searchPath : ".";
+      const entries: FilePermissionTargetEntry[] = [{ path: searchPath, operation: "search" }];
+      let forceSingleApproval = false;
+      if (typeof args.fileGlob === "string") {
+        const extra = extractGlobTargetInfo(searchPath, args.fileGlob);
+        if (extra.targetPath) entries.push({ path: extra.targetPath, operation: "search" });
+        if (extra.forceSingleApproval) forceSingleApproval = true;
+      }
+      return {
+        primaryOperation: "search",
+        entries,
+        forceSingleApproval,
+      };
+    }
     case "file-writeText":
     case "file-editText":
     case "file-mkdir":
-      return pathArg ? { operation: "write", paths: [pathArg] } : null;
-    case "file-copy":
+      return pathArg
+        ? { primaryOperation: "write", entries: [{ path: pathArg, operation: "write" }] }
+        : null;
+    case "file-copy": {
+      const from = typeof args.from === "string" ? args.from : undefined;
+      const to = typeof args.to === "string" ? args.to : undefined;
+      return from && to
+        ? {
+            primaryOperation: "write",
+            entries: [
+              { path: from, operation: "read" },
+              { path: to, operation: "write" },
+            ],
+          }
+        : null;
+    }
     case "file-rename": {
       const from = typeof args.from === "string" ? args.from : undefined;
       const to = typeof args.to === "string" ? args.to : undefined;
-      return from && to ? { operation: "write", paths: [from, to] } : null;
+      return from && to
+        ? {
+            primaryOperation: "write",
+            entries: [
+              { path: from, operation: "delete" },
+              { path: to, operation: "write" },
+            ],
+          }
+        : null;
     }
     case "file-remove":
-      return pathArg ? { operation: "delete", paths: [pathArg] } : null;
+      return pathArg
+        ? { primaryOperation: "delete", entries: [{ path: pathArg, operation: "delete" }] }
+        : null;
     default:
       return null;
   }
 }
 
-async function getToolPermissionMetadata(
+function inspectMcpEnv(env: Readonly<Record<string, string>> | undefined): {
+  envKeys: string[];
+  envEntries: Array<{ key: string; value: string; dangerous: boolean }>;
+  hasDangerousEnv: boolean;
+  warnings: string[];
+} {
+  if (!env) {
+    return { envKeys: [], envEntries: [], hasDangerousEnv: false, warnings: [] };
+  }
+  const keys = Object.keys(env).sort();
+  const envEntries = keys.map((key) => ({
+    key,
+    value: env[key],
+    dangerous: isDangerousMcpEnvKey(key),
+  }));
+  const dangerousKeys = envEntries.filter((e) => e.dangerous).map((e) => e.key);
+  const warnings =
+    dangerousKeys.length > 0
+      ? [`Sets execution-influencing environment variables: ${dangerousKeys.join(", ")}`]
+      : [];
+  return {
+    envKeys: keys,
+    envEntries,
+    hasDangerousEnv: dangerousKeys.length > 0,
+    warnings,
+  };
+}
+
+export function isLocalOrPrivateHostname(rawHostname: string): boolean {
+  const host = rawHostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "");
+  if (!host) return false;
+  if (host === "localhost" || host.endsWith(".localhost")) {
+    return true;
+  }
+  return isCloudMetadataHostOrIp(host) || isPrivateOrLocalIpAddress(host);
+}
+
+const INLINE_TASK_FENCE_OPEN_RE = /^\s*```(?:task|tell-solomon|tell-rowboat)(?:\s|$|[^\s]*)/i;
+
+function extractInlineTaskBlocks(text: string): string[] {
+  const lines = text.split(/\r?\n/);
+  const blocks: string[] = [];
+  let inBlock = false;
+  let current: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!inBlock) {
+      if (/^```(?:task|tell-solomon|tell-rowboat)/i.test(trimmed)) {
+        inBlock = true;
+        current = [trimmed];
+      }
+    } else {
+      current.push(line);
+      if (trimmed === "```") {
+        blocks.push(current.join("\n"));
+        inBlock = false;
+        current = [];
+      }
+    }
+  }
+  if (inBlock && current.length > 0) {
+    blocks.push(current.join("\n"));
+  }
+  return blocks;
+}
+
+/**
+ * Computes a canonical signature of any headless-agent trigger directives
+ * (YAML `live:` / `live_note: true` frontmatter or fenced ```task / ```tell-solomon / ```tell-rowboat blocks)
+ * present in markdown content. Returns `null` if no triggers are present.
+ */
+function extractHeadlessTriggerSignature(text: string): string | null {
+  if (!text) return null;
+  let liveTrigger: unknown = undefined;
+  let hasLiveTrigger = false;
+
+  // 1. Authoritative YAML frontmatter parse (catches quoted keys `"live":`, YAML escapes,
+  // and flow mappings `{ live: { objective: ... } }` that regexes miss).
+  const { frontmatter } = splitFrontmatter(text);
+  if (Object.prototype.hasOwnProperty.call(frontmatter, "live") && frontmatter.live !== undefined) {
+    hasLiveTrigger = true;
+    liveTrigger = frontmatter.live;
+  }
+  if (frontmatter.live_note === true) {
+    hasLiveTrigger = true;
+    liveTrigger = { live: liveTrigger, live_note: true };
+  }
+
+  // 2. Regex fallback for unclosed/partial frontmatter snippets
+  if (
+    !hasLiveTrigger &&
+    /^---[\s\S]*?(?:^|\r?\n)\s*(?:["']?live["']?\s*:|["']?live_note["']?\s*:\s*true)/m.test(text)
+  ) {
+    hasLiveTrigger = true;
+    liveTrigger = "__partial_frontmatter__";
+  }
+
+  // 3. Fenced inline-task blocks (matches inline_tasks.ts startsWith semantics: task, tell-solomon, tell-rowboat)
+  const taskBlocks = extractInlineTaskBlocks(text);
+  const hasInlineFence =
+    taskBlocks.length > 0 ||
+    text.split(/\r?\n/).some((line) => INLINE_TASK_FENCE_OPEN_RE.test(line));
+
+  if (!hasLiveTrigger && !hasInlineFence) {
+    return null;
+  }
+  return JSON.stringify({ live: liveTrigger ?? null, tasks: taskBlocks });
+}
+
+function simulateEditTextContent(
+  existing: string,
+  oldString: string,
+  newString: string,
+  replaceAll: boolean,
+): string | null {
+  if (!oldString) return null;
+  if (replaceAll) {
+    return existing.split(oldString).join(newString);
+  }
+  const idx = existing.indexOf(oldString);
+  if (idx === -1) return null;
+  return existing.slice(0, idx) + newString + existing.slice(idx + oldString.length);
+}
+
+function directoryContainsHeadlessTriggerMarkdown(dirPath: string, depth = 0): boolean {
+  if (depth > 8) return true; // Fail closed on deep directory trees
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    return true; // Fail closed if unreadable
+  }
+  for (const entry of entries) {
+    const full = path.join(dirPath, entry.name);
+    if (entry.isSymbolicLink()) return true;
+    if (entry.isDirectory()) {
+      if (directoryContainsHeadlessTriggerMarkdown(full, depth + 1)) return true;
+    } else if (entry.name.toLowerCase().endsWith(".md")) {
+      try {
+        const content = fs.readFileSync(full, "utf8");
+        if (extractHeadlessTriggerSignature(content) !== null) return true;
+      } catch {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function inspectMcpHttpUrlWarnings(rawUrl: string): string[] {
+  const warnings: string[] = [];
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol === "http:") {
+      warnings.push("Uses unencrypted HTTP (not HTTPS)");
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (isLocalOrPrivateHostname(host)) {
+      warnings.push(`Targets local or private network host (${host})`);
+    }
+  } catch {
+    warnings.push("URL could not be parsed");
+  }
+  return warnings;
+}
+
+function buildAddMcpServerPermission(args: Record<string, unknown>): ToolPermissionMetadataValue {
+  const nameResult = McpServerName.safeParse(args.serverName);
+  const serverName = nameResult.success
+    ? nameResult.data
+    : typeof args.serverName === "string" && args.serverName.trim()
+      ? args.serverName.trim()
+      : "<unknown>";
+  const warnings: string[] = [];
+  if (!nameResult.success) {
+    warnings.push("Invalid server name");
+  }
+
+  const parsedConfig = McpServerDefinition.safeParse(args.config);
+  if (parsedConfig.success) {
+    const cfg = parsedConfig.data;
+    if ("command" in cfg) {
+      const commandArgs = cfg.args ?? [];
+      const envInfo = inspectMcpEnv(cfg.env);
+      const configDigest = computeStdioMcpConfigDigest(serverName, {
+        command: cfg.command,
+        args: commandArgs,
+        env: cfg.env,
+      });
+      const allWarnings = [...warnings, ...envInfo.warnings];
+      return {
+        kind: "mcp",
+        action: "install",
+        serverName,
+        transport: "stdio",
+        command: cfg.command,
+        args: commandArgs,
+        envKeys: envInfo.envKeys,
+        ...(envInfo.envEntries.length > 0 ? { envEntries: envInfo.envEntries } : {}),
+        ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}),
+        configDigest,
+        allowScopeGrant: false,
+      };
+    }
+
+    const headerKeys = cfg.headers ? Object.keys(cfg.headers).sort() : [];
+    const allWarnings = [...warnings, ...inspectMcpHttpUrlWarnings(cfg.url)];
+    return {
+      kind: "mcp",
+      action: "install",
+      serverName,
+      transport: "http",
+      url: cfg.url,
+      headerKeys,
+      ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}),
+      allowScopeGrant: false,
+    };
+  }
+
+  // Invalid or ambiguous (e.g. dual-field) server config — still fail closed and
+  // warn the user; addMcpServer.execute will also reject it.
+  warnings.push(
+    `Invalid MCP server configuration: ${parsedConfig.error.issues.map((i) => i.message).join("; ")}`,
+  );
+  return {
+    kind: "mcp",
+    action: "install",
+    serverName,
+    transport: "stdio",
+    warnings,
+    allowScopeGrant: false,
+  };
+}
+
+async function getMcpStdioSpawnPermission(
+  serverName: string,
+  sessionAllowedMcpSpawns: Set<string>,
+): Promise<ToolPermissionMetadataValue | null> {
+  // Use the exact untrimmed serverName because listTools/executeTool look up
+  // the exact key in mcp.json.
+  if (!serverName) return null;
+
+  const requirement = await getStdioMcpSpawnRequirement(serverName);
+  if (!requirement) {
+    return null;
+  }
+
+  if (sessionAllowedMcpSpawns.has(requirement.configDigest)) {
+    return null;
+  }
+
+  const persistentGrants = getMcpServerAllowList();
+  const isPersistentlyApproved = persistentGrants.some(
+    (grant) =>
+      grant.serverName === requirement.serverName &&
+      grant.configDigest === requirement.configDigest,
+  );
+  if (isPersistentlyApproved) {
+    return null;
+  }
+
+  const envInfo = inspectMcpEnv(requirement.env);
+
+  return {
+    kind: "mcp",
+    action: "spawn",
+    serverName: requirement.serverName,
+    transport: "stdio",
+    command: requirement.command,
+    args: [...requirement.args],
+    envKeys: [...requirement.envKeys],
+    ...(envInfo.envEntries.length > 0 ? { envEntries: envInfo.envEntries } : {}),
+    ...(envInfo.warnings.length > 0 ? { warnings: envInfo.warnings } : {}),
+    configDigest: requirement.configDigest,
+    allowScopeGrant: !envInfo.hasDangerousEnv,
+  };
+}
+
+export async function getToolPermissionMetadata(
   toolCall: z.infer<typeof ToolCallPart>,
   underlyingTool: z.infer<typeof ToolAttachment>,
   sessionAllowedCommands: Set<string>,
   sessionAllowedFileAccess: FileAccessGrant[],
+  sessionAllowedMcpSpawns: Set<string> = new Set(),
+  options?: {
+    codeMode?: "claude" | "codex" | null;
+    agentName?: string | null;
+  },
 ): Promise<ToolPermissionMetadataValue | null> {
+  if (underlyingTool.type === "mcp") {
+    return getMcpStdioSpawnPermission(underlyingTool.mcpServerName, sessionAllowedMcpSpawns);
+  }
+
   if (underlyingTool.type !== "builtin") {
     return null;
   }
 
+  const parsedArgs = z.record(z.string(), z.unknown()).safeParse(toolCall.arguments);
+  const args: Record<string, unknown> = parsedArgs.success ? parsedArgs.data : {};
+
   if (underlyingTool.name === "executeCommand") {
-    const args = toolCall.arguments;
-    if (!args || typeof args !== "object" || !("command" in args)) {
+    if (!("command" in args)) {
       return null;
     }
-    const command = String((args as { command: unknown }).command);
-    if (!isBlocked(command, sessionAllowedCommands)) {
+    const command = String(args.command);
+    const cwd = typeof args.cwd === "string" ? args.cwd : undefined;
+    const evaluation = evaluateCommandSecurity(command, sessionAllowedCommands, { cwd });
+    if (!evaluation.blocked) {
       return null;
     }
     return {
       kind: "command",
-      commandNames: extractCommandNames(command),
+      commandNames: evaluation.commandNames,
+      cwd: resolveCommandWorkingDir(cwd),
+      ...(evaluation.capabilityReasons.length > 0 ? { reasons: evaluation.capabilityReasons } : {}),
+      allowScopeGrant: evaluation.allowScopeGrant,
     };
   }
 
-  const args =
-    toolCall.arguments && typeof toolCall.arguments === "object"
-      ? (toolCall.arguments as Record<string, unknown>)
-      : {};
+  if (underlyingTool.name === "code_agent_run") {
+    const requestedAgent = options?.codeMode ?? (args.agent === "codex" ? "codex" : "claude");
+    const rawCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : ".";
+    const resolvedCwd = await resolveFilePathForPermission(rawCwd);
+    const reasons: string[] = [];
+    if (!options?.codeMode) {
+      reasons.push(
+        "Code Mode is not active on this turn — explicit approval is required to spawn a coding agent",
+      );
+    }
+    if (
+      resolvedCwd.isInsideWorkspace &&
+      isProtectedWorkspacePath(resolvedCwd.canonicalPath, "write")
+    ) {
+      reasons.push("Coding agent working directory targets protected workspace configuration");
+    } else if (isSensitiveOrBroadExternalGrantPrefix(resolvedCwd.canonicalPath)) {
+      reasons.push(
+        "Coding agent working directory targets a broad or sensitive system/home directory",
+      );
+    }
+    if (reasons.length > 0) {
+      return {
+        kind: "command",
+        commandNames: [`code_agent_run:${requestedAgent}`],
+        cwd: resolvedCwd.canonicalPath,
+        reasons,
+        allowScopeGrant: false,
+      };
+    }
+    return null;
+  }
+
+  if (underlyingTool.name === "save-to-memory") {
+    const inboxPath = path.resolve(AGENT_NOTES_DIR, "inbox.md");
+    return {
+      kind: "file",
+      operation: "write",
+      paths: [inboxPath],
+      pathPrefix: path.resolve(AGENT_NOTES_DIR),
+      allowScopeGrant: false,
+    };
+  }
+
+  if (
+    underlyingTool.name === "run-live-note-agent" ||
+    underlyingTool.name === "run-background-task-agent"
+  ) {
+    return {
+      kind: "command",
+      commandNames: [underlyingTool.name],
+      cwd: path.resolve(WorkDir),
+      reasons: [`Triggers headless agent execution (${underlyingTool.name})`],
+      allowScopeGrant: false,
+    };
+  }
+
+  if (underlyingTool.name === "rowboat-configure-integration-mcp") {
+    const connector =
+      typeof args.connector === "string" && args.connector.trim()
+        ? args.connector.trim()
+        : "<connector>";
+    return {
+      kind: "mcp",
+      action: "install",
+      serverName: `rowboat-${connector}`,
+      transport: "http",
+      warnings: ["Installs or updates a managed integration MCP server entry in mcp.json"],
+      allowScopeGrant: false,
+    };
+  }
+
+  if (
+    underlyingTool.name === "create-background-task" ||
+    underlyingTool.name === "patch-background-task"
+  ) {
+    const label =
+      underlyingTool.name === "patch-background-task"
+        ? typeof args.slug === "string" && args.slug.trim()
+          ? args.slug.trim()
+          : "<task>"
+        : typeof args.name === "string" && args.name.trim()
+          ? args.name.trim()
+          : "<new-task>";
+    const bgTasksRoot = path.resolve(WorkDir, "bg-tasks");
+    const displayPath = path.join(bgTasksRoot, label, "task.yaml");
+    return {
+      kind: "file",
+      operation: "write",
+      paths: [displayPath],
+      pathPrefix: bgTasksRoot,
+      allowScopeGrant: false,
+    };
+  }
+
+  if (underlyingTool.name === "addMcpServer") {
+    return buildAddMcpServerPermission(args);
+  }
+
+  if (underlyingTool.name === "listMcpTools" || underlyingTool.name === "executeMcpTool") {
+    const serverName = typeof args.serverName === "string" ? args.serverName : "";
+    return getMcpStdioSpawnPermission(serverName, sessionAllowedMcpSpawns);
+  }
+
+  if (underlyingTool.name === "browser-control") {
+    const action = typeof args.action === "string" ? args.action : "";
+    const hasTarget = typeof args.target === "string" && args.target.trim().length > 0;
+    const isMutatingBrowserAction =
+      action === "navigate" ||
+      action === "click" ||
+      action === "type" ||
+      action === "press" ||
+      (action === "new-tab" && hasTarget);
+    if (isMutatingBrowserAction) {
+      const targetDetail = hasTarget ? ` (${String(args.target).trim().slice(0, 120)})` : "";
+      return {
+        kind: "command",
+        commandNames: ["browser-control"],
+        reasons: [
+          `Browser action "${action}"${targetDetail} interacts with or navigates your authenticated embedded browser session`,
+        ],
+        allowScopeGrant: false,
+      };
+    }
+    return null;
+  }
+
   const targets = filePermissionTargets(underlyingTool.name, args);
   if (!targets) {
     return null;
   }
 
   const resolvedTargets = await Promise.all(
-    targets.paths.map((p) => resolveFilePathForPermission(p)),
+    targets.entries.map(async (entry) => ({
+      operation: entry.operation,
+      resolved: await resolveFilePathForPermission(entry.path),
+    })),
   );
-  const outsideWorkspacePaths = resolvedTargets
-    .filter((target) => !target.isInsideWorkspace)
-    .map((target) => target.canonicalPath);
-  if (!outsideWorkspacePaths.length) {
+
+  // Planting or modifying live-note (`live:` / `live_note: true`) or inline-task
+  // (```task / ```tell-solomon / ```tell-rowboat) triggers inside `knowledge/**/*.md`
+  // via write, edit, copy, or rename installs persistent scheduled/event-driven
+  // headless agents and requires explicit interactive approval.
+  let plantsHeadlessTrigger = false;
+  const knowledgeRoot = path.resolve(WorkDir, "knowledge");
+  const isKnowledgeMarkdown = (canonicalPath: string): boolean =>
+    canonicalPath.toLowerCase().endsWith(".md") && isPathInsideDir(knowledgeRoot, canonicalPath);
+
+  if (underlyingTool.name === "file-writeText") {
+    const dest = resolvedTargets[0]?.resolved;
+    if (dest?.isInsideWorkspace && isKnowledgeMarkdown(dest.canonicalPath)) {
+      const data = typeof args.data === "string" ? args.data : "";
+      const afterSig = extractHeadlessTriggerSignature(data);
+      if (afterSig !== null) {
+        let beforeSig: string | null = null;
+        try {
+          if (fs.existsSync(dest.canonicalPath)) {
+            beforeSig = extractHeadlessTriggerSignature(
+              fs.readFileSync(dest.canonicalPath, "utf8"),
+            );
+          }
+        } catch {
+          beforeSig = null;
+        }
+        // Prompt whenever a trigger is newly planted or modified (or always for non-live-note agents)
+        if (options?.agentName !== "live-note-agent" || beforeSig !== afterSig) {
+          plantsHeadlessTrigger = true;
+        }
+      }
+    }
+  } else if (underlyingTool.name === "file-editText") {
+    const dest = resolvedTargets[0]?.resolved;
+    if (dest?.isInsideWorkspace && isKnowledgeMarkdown(dest.canonicalPath)) {
+      const oldString = typeof args.oldString === "string" ? args.oldString : "";
+      const newString = typeof args.newString === "string" ? args.newString : "";
+      const replaceAll = args.replaceAll === true;
+      let existingContent: string | null = null;
+      try {
+        existingContent = fs.readFileSync(dest.canonicalPath, "utf8");
+      } catch {
+        existingContent = null;
+      }
+      if (existingContent !== null) {
+        const beforeSig = extractHeadlessTriggerSignature(existingContent);
+        const simulated = simulateEditTextContent(
+          existingContent,
+          oldString,
+          newString,
+          replaceAll,
+        );
+        const afterSig =
+          simulated !== null
+            ? extractHeadlessTriggerSignature(simulated)
+            : extractHeadlessTriggerSignature(newString);
+        // Gate if the edit introduces a new trigger OR modifies any existing live/task directive
+        if (afterSig !== null && afterSig !== beforeSig) {
+          plantsHeadlessTrigger = true;
+        }
+      } else if (extractHeadlessTriggerSignature(newString) !== null) {
+        plantsHeadlessTrigger = true;
+      }
+    }
+  } else if (underlyingTool.name === "file-copy" || underlyingTool.name === "file-rename") {
+    const source = resolvedTargets[0]?.resolved;
+    const dest = resolvedTargets[1]?.resolved;
+    if (source && dest?.isInsideWorkspace && isPathInsideDir(knowledgeRoot, dest.canonicalPath)) {
+      try {
+        const srcStat = fs.lstatSync(source.canonicalPath);
+        if (srcStat.isDirectory()) {
+          if (directoryContainsHeadlessTriggerMarkdown(source.canonicalPath)) {
+            plantsHeadlessTrigger = true;
+          }
+        } else if (isKnowledgeMarkdown(dest.canonicalPath)) {
+          const content = fs.readFileSync(source.canonicalPath, "utf8");
+          if (extractHeadlessTriggerSignature(content) !== null) {
+            plantsHeadlessTrigger = true;
+          }
+        }
+      } catch {
+        // Fail closed when moving/copying an unreadable file into knowledge/**/*.md
+        if (isKnowledgeMarkdown(dest.canonicalPath)) {
+          plantsHeadlessTrigger = true;
+        }
+      }
+    }
+  }
+
+  const protectedPaths = resolvedTargets
+    .filter(({ operation, resolved }) => {
+      if (!resolved.isInsideWorkspace) return false;
+      if (!isProtectedWorkspacePath(resolved.canonicalPath, operation)) {
+        return false;
+      }
+      // Narrow exemption: the dedicated headless `agent_notes_agent` maintains
+      // `knowledge/Agent Notes/**` and has no shell/MCP/network capabilities.
+      if (
+        options?.agentName === "agent_notes_agent" &&
+        operation === "write" &&
+        isAgentNotesWorkspacePath(resolved.canonicalPath)
+      ) {
+        return false;
+      }
+      return true;
+    })
+    .map(({ resolved }) => resolved.canonicalPath);
+  const outsideWorkspaceTargets = resolvedTargets.filter(
+    ({ resolved }) => !resolved.isInsideWorkspace,
+  );
+  const outsideWorkspacePaths = outsideWorkspaceTargets.map(
+    ({ resolved }) => resolved.canonicalPath,
+  );
+
+  if (protectedPaths.length > 0 || targets.forceSingleApproval || plantsHeadlessTrigger) {
+    const allPromptPaths = Array.from(
+      new Set([
+        ...protectedPaths,
+        ...outsideWorkspacePaths,
+        ...(targets.forceSingleApproval || plantsHeadlessTrigger
+          ? resolvedTargets.map(({ resolved }) => resolved.canonicalPath)
+          : []),
+      ]),
+    );
+    return {
+      kind: "file",
+      operation: targets.primaryOperation,
+      paths: allPromptPaths,
+      pathPrefix: grantPrefixForTool(underlyingTool.name, allPromptPaths),
+      allowScopeGrant: false,
+    };
+  }
+
+  if (!outsideWorkspaceTargets.length) {
     return null;
   }
 
   const persistentGrants = getFileAccessAllowList();
   const allGrants = [...persistentGrants, ...sessionAllowedFileAccess];
-  const uncovered = outsideWorkspacePaths.filter(
-    (resolvedPath) =>
-      !allGrants.some((grant) => fileGrantCoversPath(grant, targets.operation, resolvedPath)),
+  const uncoveredTargets = outsideWorkspaceTargets.filter(
+    ({ operation, resolved }) =>
+      !allGrants.some((grant) => fileGrantCoversPath(grant, operation, resolved.canonicalPath)),
   );
-  if (!uncovered.length) {
+  if (!uncoveredTargets.length) {
     return null;
   }
 
+  const uncoveredPaths = uncoveredTargets.map(({ resolved }) => resolved.canonicalPath);
+  const effectiveOperation =
+    uncoveredTargets.length === 1 ? uncoveredTargets[0].operation : targets.primaryOperation;
+  const pathPrefix = grantPrefixForTool(underlyingTool.name, uncoveredPaths);
+  const allowScopeGrant =
+    !isSensitiveOrBroadExternalGrantPrefix(pathPrefix) &&
+    !isProtectedWorkspacePath(pathPrefix, effectiveOperation);
+
   return {
     kind: "file",
-    operation: targets.operation,
-    paths: uncovered,
-    pathPrefix: grantPrefixForTool(underlyingTool.name, uncovered),
+    operation: effectiveOperation,
+    paths: uncoveredPaths,
+    pathPrefix,
+    allowScopeGrant,
   };
 }
 
@@ -446,6 +1365,8 @@ export class AgentRuntime implements IAgentRuntime {
         type: "run-processing-start",
         subflow: [],
       });
+      let pinnedAgentName: string | null = null;
+      let pinnedPermissionMode: "manual" | "auto" | null = null;
       while (true) {
         // Check for abort before each iteration
         if (signal.aborted) {
@@ -460,6 +1381,17 @@ export class AgentRuntime implements IAgentRuntime {
         const state = new AgentState();
         for (const event of run.log) {
           state.ingest(event);
+        }
+        if (pinnedAgentName === null) {
+          pinnedAgentName = state.agentName;
+          pinnedPermissionMode = state.permissionMode;
+        } else if (
+          state.agentName !== pinnedAgentName ||
+          state.permissionMode !== pinnedPermissionMode
+        ) {
+          throw new Error(
+            `Run ${runId} metadata changed unexpectedly during execution; aborting for safety.`,
+          );
         }
         try {
           for await (const event of streamAgent({
@@ -1036,6 +1968,38 @@ async function buildTools(agent: z.infer<typeof Agent>): Promise<ToolSet> {
   return tools;
 }
 
+/**
+ * Extract ONLY raw user-authored text messages for the auto-permission classifier.
+ * Excludes `userMessageContext` (open middle-pane notes or browser page metadata)
+ * and attachment blocks so untrusted page/note content cannot inject instructions
+ * or evict the real user request via truncation.
+ */
+export function extractTrustedUserMessagesForClassifier(
+  messages: z.infer<typeof MessageList>,
+): ModelMessage[] {
+  const result: ModelMessage[] = [];
+  for (const msg of messages) {
+    if (msg.role !== "user") continue;
+    if (typeof msg.content === "string") {
+      const text = msg.content.trim();
+      if (text) {
+        result.push({ role: "user", content: text });
+      }
+      continue;
+    }
+    const textParts: string[] = [];
+    for (const part of msg.content) {
+      if (part.type === "text" && part.text.trim()) {
+        textParts.push(part.text);
+      }
+    }
+    if (textParts.length > 0) {
+      result.push({ role: "user", content: textParts.join("\n") });
+    }
+  }
+  return result;
+}
+
 export class AgentState {
   runId: string | null = null;
   agent: z.infer<typeof Agent> | null = null;
@@ -1058,6 +2022,9 @@ export class AgentState {
   autoDeniedToolCalls: Record<string, { reason: string }> = {};
   sessionAllowedCommands: Set<string> = new Set();
   sessionAllowedFileAccess: FileAccessGrant[] = [];
+  sessionAllowedMcpSpawns: Set<string> = new Set();
+  approvedMcpSpawnDigests: Record<string, string> = {};
+  approvedCodeAgentByToolCallId: Record<string, "claude" | "codex"> = {};
 
   getPendingPermissions(): z.infer<typeof ToolPermissionRequestEvent>[] {
     const response: z.infer<typeof ToolPermissionRequestEvent>[] = [];
@@ -1170,13 +2137,15 @@ export class AgentState {
       case "spawn-subflow":
         // Seed the subflow state with its agent so downstream loadAgent works.
         // Subflows inherit the parent run's model+provider — there's one pair per run.
+        // Subflows always use manual permission mode because their initial "user"
+        // message is model-authored by the parent agent rather than directly typed by the user.
         if (!this.subflowStates[event.toolCallId]) {
           this.subflowStates[event.toolCallId] = new AgentState();
         }
         this.subflowStates[event.toolCallId].agentName = event.agentName;
         this.subflowStates[event.toolCallId].runModel = this.runModel;
         this.subflowStates[event.toolCallId].runProvider = this.runProvider;
-        this.subflowStates[event.toolCallId].permissionMode = this.permissionMode;
+        this.subflowStates[event.toolCallId].permissionMode = "manual";
         this.subflowStates[event.toolCallId].runUseCase = this.runUseCase;
         this.subflowStates[event.toolCallId].runSubUseCase = this.runSubUseCase;
         break;
@@ -1185,14 +2154,22 @@ export class AgentState {
         if (event.message.content instanceof Array) {
           for (const part of event.message.content) {
             if (part.type === "tool-call") {
-              this.toolCallIdMap[part.toolCallId] = part;
-              this.pendingToolCalls[part.toolCallId] = true;
+              // Ignore duplicate toolCallIds so a second tool-call part cannot
+              // overwrite the arguments associated with an already-requested ID.
+              if (!Object.prototype.hasOwnProperty.call(this.toolCallIdMap, part.toolCallId)) {
+                this.toolCallIdMap[part.toolCallId] = part;
+                this.pendingToolCalls[part.toolCallId] = true;
+              }
             }
           }
         }
         if (event.message.role === "tool") {
           const message = event.message as z.infer<typeof ToolMessage>;
           delete this.pendingToolCalls[message.toolCallId];
+          delete this.allowedToolCallIds[message.toolCallId];
+          delete this.deniedToolCallIds[message.toolCallId];
+          delete this.approvedMcpSpawnDigests[message.toolCallId];
+          delete this.approvedCodeAgentByToolCallId[message.toolCallId];
         }
         if (event.message.role === "assistant") {
           this.lastAssistantMsg = event.message;
@@ -1201,66 +2178,142 @@ export class AgentState {
       case "tool-permission-request":
         this.pendingToolPermissionRequests[event.toolCall.toolCallId] = event;
         break;
-      case "tool-permission-response":
-        switch (event.response) {
-          case "approve":
+      case "tool-permission-response": {
+        const permissionRequest = this.pendingToolPermissionRequests[event.toolCallId];
+        // Ignore orphaned or replayed responses without an active pending request
+        if (!permissionRequest) {
+          break;
+        }
+        const permission = permissionRequest.permission;
+        const response = event.response;
+        switch (response) {
+          case "approve": {
             this.allowedToolCallIds[event.toolCallId] = true;
-            {
-              const permissionRequest = this.pendingToolPermissionRequests[event.toolCallId];
-              if (event.scope === "session" && permissionRequest?.permission?.kind === "file") {
-                this.sessionAllowedFileAccess.push({
-                  operation: permissionRequest.permission.operation,
-                  pathPrefix: permissionRequest.permission.pathPrefix,
-                });
+            if (
+              permission?.kind === "mcp" &&
+              permission.action === "spawn" &&
+              permission.configDigest
+            ) {
+              // Bind one-time approval strictly to this toolCallId so `scope: "once"`
+              // never silently upgrades to a run-wide grant.
+              this.approvedMcpSpawnDigests[event.toolCallId] = permission.configDigest;
+            }
+            if (
+              permission?.kind === "command" &&
+              permissionRequest.toolCall.toolName === "code_agent_run"
+            ) {
+              const approvedCmd = permission.commandNames[0];
+              if (approvedCmd === "code_agent_run:claude") {
+                this.approvedCodeAgentByToolCallId[event.toolCallId] = "claude";
+              } else if (approvedCmd === "code_agent_run:codex") {
+                this.approvedCodeAgentByToolCallId[event.toolCallId] = "codex";
               }
             }
-            // For session scope, extract command names and add to session allowlist
-            if (event.scope === "session") {
-              const toolCall = this.toolCallIdMap[event.toolCallId];
-              if (
-                toolCall &&
-                typeof toolCall.arguments === "object" &&
-                toolCall.arguments !== null &&
-                "command" in toolCall.arguments
-              ) {
-                const names = extractCommandNames(String(toolCall.arguments.command));
-                for (const name of names) {
-                  this.sessionAllowedCommands.add(name);
+            if (event.scope === "session" && permission?.allowScopeGrant === true) {
+              switch (permission.kind) {
+                case "file": {
+                  if (
+                    !isSensitiveOrBroadExternalGrantPrefix(permission.pathPrefix) &&
+                    !isProtectedWorkspacePath(permission.pathPrefix, permission.operation)
+                  ) {
+                    this.sessionAllowedFileAccess.push({
+                      operation: permission.operation,
+                      pathPrefix: permission.pathPrefix,
+                    });
+                  }
+                  break;
+                }
+                case "mcp": {
+                  if (permission.action === "spawn" && permission.configDigest) {
+                    this.sessionAllowedMcpSpawns.add(permission.configDigest);
+                  }
+                  break;
+                }
+                case "command": {
+                  const rawNames =
+                    permission.commandNames.length > 0
+                      ? permission.commandNames
+                      : (() => {
+                          const toolCall = this.toolCallIdMap[event.toolCallId];
+                          return toolCall &&
+                            typeof toolCall.arguments === "object" &&
+                            toolCall.arguments !== null &&
+                            !Array.isArray(toolCall.arguments) &&
+                            "command" in toolCall.arguments
+                            ? extractCommandNames(String(toolCall.arguments.command))
+                            : [];
+                        })();
+                  const safeNames = rawNames.filter(
+                    (name) => !isAlwaysRequireApprovalCommand(name),
+                  );
+                  for (const name of safeNames) {
+                    this.sessionAllowedCommands.add(name);
+                  }
+                  break;
+                }
+                default: {
+                  const unhandled: never = permission;
+                  throw new Error(`Unhandled permission kind: ${String(unhandled)}`);
                 }
               }
             }
             break;
+          }
           case "deny":
             this.deniedToolCallIds[event.toolCallId] = true;
             delete this.autoDeniedToolCalls[event.toolCallId];
             break;
+          default: {
+            const unhandled: never = response;
+            throw new Error(`Unhandled permission response: ${String(unhandled)}`);
+          }
         }
         delete this.pendingToolPermissionRequests[event.toolCallId];
         break;
-      case "tool-permission-auto-decision":
-        switch (event.decision) {
+      }
+      case "tool-permission-auto-decision": {
+        const decision = event.decision;
+        switch (decision) {
           case "allow":
+            // Defense-in-depth: never accept an auto-allow for MCP, external write/delete,
+            // or non-scope-grantable calls
+            if (
+              event.permission?.kind === "mcp" ||
+              event.permission?.allowScopeGrant !== true ||
+              (event.permission?.kind === "file" &&
+                (event.permission.operation === "write" || event.permission.operation === "delete"))
+            ) {
+              break;
+            }
             this.allowedToolCallIds[event.toolCallId] = true;
             this.autoAllowedToolCalls[event.toolCallId] = { reason: event.reason };
             break;
           case "deny":
             this.autoDeniedToolCalls[event.toolCallId] = { reason: event.reason };
             break;
+          default: {
+            const unhandled: never = decision;
+            throw new Error(`Unhandled auto-permission decision: ${String(unhandled)}`);
+          }
         }
         break;
+      }
       case "ask-human-request":
         this.pendingAskHumanRequests[event.toolCallId] = event;
         break;
       case "ask-human-response": {
-        // console.error('im here', this.agentName, this.runId, event.subflow);
         const ogEvent = this.pendingAskHumanRequests[event.toolCallId];
+        if (!ogEvent) {
+          break;
+        }
+        const toolCall = this.toolCallIdMap[ogEvent.toolCallId];
         this.messages.push({
           role: "tool",
           content: JSON.stringify({
             userResponse: event.response,
           }),
           toolCallId: ogEvent.toolCallId,
-          toolName: this.toolCallIdMap[ogEvent.toolCallId]!.toolName,
+          toolName: toolCall?.toolName ?? "ask-human",
         });
         delete this.pendingAskHumanRequests[ogEvent.toolCallId];
         break;
@@ -1278,6 +2331,7 @@ export async function* streamAgent({
   signal,
   abortRegistry,
   bus,
+  subflowPath = [],
 }: {
   state: AgentState;
   idGenerator: IMonotonicallyIncreasingIdGenerator;
@@ -1287,7 +2341,9 @@ export async function* streamAgent({
   signal: AbortSignal;
   abortRegistry: IAbortRegistry;
   bus: IBus;
+  subflowPath?: string[];
 }): AsyncGenerator<z.infer<typeof RunEvent>, void, unknown> {
+  const isSubflow = subflowPath.length > 0;
   const logger = new PrefixLogger(`run-${runId}-${state.agentName}`);
 
   async function* processEvent(
@@ -1382,6 +2438,64 @@ export async function* streamAgent({
         continue;
       }
 
+      const underlyingTool =
+        agent.tools && Object.prototype.hasOwnProperty.call(agent.tools, toolCall.toolName)
+          ? agent.tools[toolCall.toolName]
+          : undefined;
+      if (!underlyingTool) {
+        const missingResult = {
+          success: false,
+          error: `Unknown tool: ${toolCall.toolName}`,
+          toolName: toolCall.toolName,
+        };
+        yield* processEvent({
+          runId,
+          type: "tool-result",
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          result: missingResult,
+          subflow: [],
+        });
+        yield* processEvent({
+          runId,
+          messageId: await idGenerator.next(),
+          type: "message",
+          message: {
+            role: "tool",
+            content: JSON.stringify(missingResult),
+            toolCallId: toolCall.toolCallId,
+            toolName: toolCall.toolName,
+          },
+          subflow: [],
+        });
+        continue;
+      }
+
+      if (!state.allowedToolCallIds[toolCallId]) {
+        // Re-check permissions right before execution so a prior tool call in
+        // the same turn (e.g. addMcpServer overwriting a server with a stdio
+        // command) or an external config change cannot bypass approval.
+        const latePermission = await getToolPermissionMetadata(
+          toolCall,
+          underlyingTool,
+          state.sessionAllowedCommands,
+          state.sessionAllowedFileAccess,
+          state.sessionAllowedMcpSpawns,
+          { codeMode, agentName: state.agentName },
+        );
+        if (latePermission) {
+          _logger.log("emitting late tool-permission-request before execution");
+          yield* processEvent({
+            runId,
+            type: "tool-permission-request",
+            toolCall,
+            permission: latePermission,
+            subflow: [],
+          });
+          continue;
+        }
+      }
+
       // execute approved tool
       // Check abort before starting tool execution
       if (signal.aborted) {
@@ -1398,8 +2512,57 @@ export async function* streamAgent({
         subflow: [],
       });
       let result: unknown = null;
+      let subflowPaused = false;
       try {
-        if (agent.tools![toolCall.toolName].type === "agent") {
+        let mcpSpawnPolicy: McpSpawnPolicy | undefined;
+        const isMcpSpawnCapableTool =
+          underlyingTool.type === "mcp" ||
+          (underlyingTool.type === "builtin" &&
+            (underlyingTool.name === "listMcpTools" || underlyingTool.name === "executeMcpTool"));
+        if (isMcpSpawnCapableTool) {
+          // Default to remote-only for every MCP spawn-capable tool call so an empty
+          // or unvalidated serverName can never fall through to an unrestricted spawn.
+          mcpSpawnPolicy = { kind: "remote-only" };
+          const mcpServerName =
+            underlyingTool.type === "mcp"
+              ? underlyingTool.mcpServerName
+              : toolCall.arguments &&
+                  typeof toolCall.arguments === "object" &&
+                  !Array.isArray(toolCall.arguments) &&
+                  "serverName" in toolCall.arguments &&
+                  typeof toolCall.arguments.serverName === "string"
+                ? toolCall.arguments.serverName
+                : "";
+          const expectedMcpDigest = state.approvedMcpSpawnDigests[toolCallId];
+          if (expectedMcpDigest) {
+            const currentReq = mcpServerName
+              ? await getStdioMcpSpawnRequirement(mcpServerName)
+              : null;
+            if (!currentReq || currentReq.configDigest !== expectedMcpDigest) {
+              throw new Error(
+                "The stdio MCP server configuration changed after approval. Refusing to spawn.",
+              );
+            }
+            mcpSpawnPolicy = { kind: "stdio", expectedDigest: expectedMcpDigest };
+          } else if (mcpServerName) {
+            const currentReq = await getStdioMcpSpawnRequirement(mcpServerName);
+            if (currentReq) {
+              const persistentGrants = getMcpServerAllowList();
+              const isAuthorized =
+                state.sessionAllowedMcpSpawns.has(currentReq.configDigest) ||
+                persistentGrants.some(
+                  (grant) =>
+                    grant.serverName === currentReq.serverName &&
+                    grant.configDigest === currentReq.configDigest,
+                );
+              if (!isAuthorized) {
+                throw new Error("The stdio MCP server requires explicit approval before spawning.");
+              }
+              mcpSpawnPolicy = { kind: "stdio", expectedDigest: currentReq.configDigest };
+            }
+          }
+        }
+        if (underlyingTool.type === "agent") {
           const subflowState = state.subflowStates[toolCallId];
           for await (const event of streamAgent({
             state: subflowState,
@@ -1410,26 +2573,33 @@ export async function* streamAgent({
             signal,
             abortRegistry,
             bus,
+            subflowPath: [...subflowPath, toolCallId],
           })) {
-            yield* processEvent({
+            // subflowState already ingested `event` inside the recursive streamAgent;
+            // yield directly with the outer subflow prefix to avoid double-ingestion.
+            yield {
               ...event,
               subflow: [toolCallId, ...event.subflow],
-            });
+            };
           }
           if (
-            !subflowState.getPendingAskHumans().length &&
-            !subflowState.getPendingPermissions().length
+            subflowState.getPendingAskHumans().length > 0 ||
+            subflowState.getPendingPermissions().length > 0
           ) {
+            subflowPaused = true;
+          } else {
             result = subflowState.finalResponse();
           }
         } else {
-          result = await execTool(agent.tools![toolCall.toolName], toolCall.arguments, {
+          result = await execTool(underlyingTool, toolCall.arguments, {
             runId,
             toolCallId,
             signal,
             abortRegistry,
             publish: (event) => bus.publish(event),
-            codeMode,
+            codeMode: state.approvedCodeAgentByToolCallId[toolCallId] ?? codeMode,
+            mcpSpawnPolicy,
+            subflow: subflowPath,
           });
         }
       } catch (error) {
@@ -1443,6 +2613,9 @@ export async function* streamAgent({
           error: message,
           toolName: toolCall.toolName,
         };
+      }
+      if (subflowPaused) {
+        continue;
       }
       const resultPayload = result === undefined ? null : result;
       const resultMsg: z.infer<typeof ToolMessage> = {
@@ -1474,43 +2647,46 @@ export async function* streamAgent({
       return;
     }
 
-    // get any queued user messages
-    while (true) {
-      const msg = await messageQueue.dequeue(runId);
-      if (!msg) {
-        break;
+    // Only the top-level run consumes queued user messages; subflows receive their
+    // input via spawn-subflow and must never steal parent messages or codeMode.
+    if (!isSubflow) {
+      while (true) {
+        const msg = await messageQueue.dequeue(runId);
+        if (!msg) {
+          break;
+        }
+        if (msg.voiceInput) {
+          voiceInput = true;
+        }
+        if (msg.searchEnabled) {
+          searchEnabled = true;
+        }
+        // Code mode is per-message: latest message decides whether the assistant
+        // should route coding work through the code-with-agents skill / chosen agent.
+        codeMode = msg.codeMode ?? null;
+        if (msg.voiceOutput) {
+          voiceOutput = msg.voiceOutput;
+        }
+        // Middle pane is NOT sticky — it should reflect the state at the moment of the
+        // latest user message. If the user closed the pane between messages, clear it.
+        middlePaneContext = msg.middlePaneContext ?? null;
+        loopLogger.log("dequeued user message", msg.messageId);
+        const userMessageContext = buildUserMessageContext({
+          agentName: state.agentName,
+          middlePaneContext,
+        });
+        yield* processEvent({
+          runId,
+          type: "message",
+          messageId: msg.messageId,
+          message: {
+            role: "user",
+            content: msg.message,
+            userMessageContext,
+          },
+          subflow: [],
+        });
       }
-      if (msg.voiceInput) {
-        voiceInput = true;
-      }
-      if (msg.searchEnabled) {
-        searchEnabled = true;
-      }
-      // Code mode is per-message: latest message decides whether the assistant
-      // should route coding work through the code-with-agents skill / chosen agent.
-      codeMode = msg.codeMode ?? null;
-      if (msg.voiceOutput) {
-        voiceOutput = msg.voiceOutput;
-      }
-      // Middle pane is NOT sticky — it should reflect the state at the moment of the
-      // latest user message. If the user closed the pane between messages, clear it.
-      middlePaneContext = msg.middlePaneContext ?? null;
-      loopLogger.log("dequeued user message", msg.messageId);
-      const userMessageContext = buildUserMessageContext({
-        agentName: state.agentName,
-        middlePaneContext,
-      });
-      yield* processEvent({
-        runId,
-        type: "message",
-        messageId: msg.messageId,
-        message: {
-          role: "user",
-          content: msg.message,
-          userMessageContext,
-        },
-        subflow: [],
-      });
     }
 
     // if last response is from assistant and text, exit
@@ -1646,7 +2822,13 @@ If the user's message is clearly NOT a coding request (small talk, an unrelated 
       const permissionCandidates: AutoPermissionCandidate[] = [];
       for (const part of message.content) {
         if (part.type === "tool-call") {
-          const underlyingTool = agent.tools![part.toolName];
+          const underlyingTool =
+            agent.tools && Object.prototype.hasOwnProperty.call(agent.tools, part.toolName)
+              ? agent.tools[part.toolName]
+              : undefined;
+          if (!underlyingTool) {
+            continue;
+          }
           if (underlyingTool.type === "builtin" && underlyingTool.name === "ask-human") {
             loopLogger.log("emitting ask-human-request, toolCallId:", part.toolCallId);
             const rawOptions = (part.arguments as { options?: unknown }).options;
@@ -1667,6 +2849,8 @@ If the user's message is clearly NOT a coding request (small talk, an unrelated 
             underlyingTool,
             state.sessionAllowedCommands,
             state.sessionAllowedFileAccess,
+            state.sessionAllowedMcpSpawns,
+            { codeMode, agentName: state.agentName },
           );
           if (permission) {
             permissionCandidates.push({ toolCall: part, permission });
@@ -1696,77 +2880,115 @@ If the user's message is clearly NOT a coding request (small talk, an unrelated 
 
       if (permissionCandidates.length > 0) {
         if (state.permissionMode === "auto") {
-          let decisionsByToolCallId = new Map<
-            string,
-            { decision: "allow" | "deny"; reason: string }
-          >();
-          try {
-            const decisions = await classifyToolPermissions({
-              runId,
-              agentName: state.agentName,
-              messages: convertFromMessages(state.messages),
-              candidates: permissionCandidates,
-              useCase: state.runUseCase ?? "copilot_chat",
-              subUseCase: state.runSubUseCase,
-            });
-            decisionsByToolCallId = new Map(
-              decisions.map((decision) => [
-                decision.toolCallId,
-                { decision: decision.decision, reason: decision.reason },
-              ]),
-            );
-          } catch (error) {
-            loopLogger.log(
-              "auto-permission classifier failed:",
-              error instanceof Error ? error.message : String(error),
-            );
+          // High-risk actions (interpreters, shell metacharacters, protected workspace
+          // paths, outside-workspace writes/deletes, code_agent_run outside code mode,
+          // and ALL MCP install/spawn calls) ALWAYS require interactive human approval
+          // and bypass the LLM classifier.
+          const mustPromptHuman: AutoPermissionCandidate[] = [];
+          const classifiableCandidates: AutoPermissionCandidate[] = [];
+          for (const candidate of permissionCandidates) {
+            const isExternalFileMutation =
+              candidate.permission.kind === "file" &&
+              (candidate.permission.operation === "write" ||
+                candidate.permission.operation === "delete");
+            if (
+              candidate.permission.allowScopeGrant !== true ||
+              candidate.permission.kind === "mcp" ||
+              isExternalFileMutation
+            ) {
+              mustPromptHuman.push(candidate);
+            } else {
+              classifiableCandidates.push(candidate);
+            }
           }
 
-          for (const candidate of permissionCandidates) {
-            const decision = decisionsByToolCallId.get(candidate.toolCall.toolCallId);
-            if (!decision) {
-              loopLogger.log(
-                "auto-permission missing decision, falling back to prompt:",
-                candidate.toolCall.toolCallId,
-              );
-              yield* processEvent({
-                runId,
-                type: "tool-permission-request",
-                toolCall: candidate.toolCall,
-                permission: candidate.permission,
-                subflow: [],
-              });
-              continue;
-            }
-
+          for (const candidate of mustPromptHuman) {
             loopLogger.log(
-              "emitting tool-permission-auto-decision, toolCallId:",
+              "high-risk permission candidate bypassing auto-classifier, prompting human:",
               candidate.toolCall.toolCallId,
-              "decision:",
-              decision.decision,
             );
             yield* processEvent({
               runId,
-              type: "tool-permission-auto-decision",
-              toolCallId: candidate.toolCall.toolCallId,
+              type: "tool-permission-request",
               toolCall: candidate.toolCall,
               permission: candidate.permission,
-              decision: decision.decision,
-              reason: decision.reason,
               subflow: [],
             });
-            if (decision.decision === "deny") {
+          }
+
+          if (classifiableCandidates.length > 0) {
+            let decisionsByToolCallId = new Map<
+              string,
+              { decision: "allow" | "deny"; reason: string }
+            >();
+            try {
+              const decisions = await classifyToolPermissions({
+                runId,
+                agentName: state.agentName,
+                messages: extractTrustedUserMessagesForClassifier(state.messages),
+                candidates: classifiableCandidates,
+                useCase: state.runUseCase ?? "copilot_chat",
+                subUseCase: state.runSubUseCase,
+              });
+              decisionsByToolCallId = new Map(
+                decisions.map((decision) => [
+                  decision.toolCallId,
+                  { decision: decision.decision, reason: decision.reason },
+                ]),
+              );
+            } catch (error) {
               loopLogger.log(
-                "auto-permission denied, falling back to prompt:",
+                "auto-permission classifier failed:",
+                error instanceof Error ? error.message : String(error),
+              );
+            }
+
+            for (const candidate of classifiableCandidates) {
+              const decision = decisionsByToolCallId.get(candidate.toolCall.toolCallId);
+              if (!decision) {
+                loopLogger.log(
+                  "auto-permission missing decision, falling back to prompt:",
+                  candidate.toolCall.toolCallId,
+                );
+                yield* processEvent({
+                  runId,
+                  type: "tool-permission-request",
+                  toolCall: candidate.toolCall,
+                  permission: candidate.permission,
+                  subflow: [],
+                });
+                continue;
+              }
+
+              loopLogger.log(
+                "emitting tool-permission-auto-decision, toolCallId:",
                 candidate.toolCall.toolCallId,
+                "decision:",
+                decision.decision,
               );
               yield* processEvent({
                 runId,
-                type: "tool-permission-request",
+                type: "tool-permission-auto-decision",
+                toolCallId: candidate.toolCall.toolCallId,
                 toolCall: candidate.toolCall,
                 permission: candidate.permission,
+                decision: decision.decision,
+                reason: decision.reason,
                 subflow: [],
               });
+              if (decision.decision === "deny") {
+                loopLogger.log(
+                  "auto-permission denied, falling back to prompt:",
+                  candidate.toolCall.toolCallId,
+                );
+                yield* processEvent({
+                  runId,
+                  type: "tool-permission-request",
+                  toolCall: candidate.toolCall,
+                  permission: candidate.permission,
+                  subflow: [],
+                });
+              }
             }
           }
         } else {

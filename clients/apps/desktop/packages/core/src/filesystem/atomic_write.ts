@@ -48,10 +48,19 @@ function tmpPathFor(file: string): string {
  *                every state/config file here; pass 0 for the size-sensitive
  *                caches (gmail thread snapshots) that were compact before.
  */
-export function writeJsonAtomicSync(file: string, value: unknown, space: number = 2): void {
+export function writeJsonAtomicSync(
+  file: string,
+  value: unknown,
+  space: number = 2,
+  mode?: number,
+): void {
   const tmp = tmpPathFor(file);
   try {
-    fs.writeFileSync(tmp, JSON.stringify(value, null, space));
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify(value, null, space),
+      mode !== undefined ? { mode } : undefined,
+    );
     fs.renameSync(tmp, file);
   } catch (error) {
     // Never leave the tmp behind: a later glob or a confused reader must not
@@ -70,8 +79,13 @@ export async function writeJsonAtomic(
   file: string,
   value: unknown,
   space: number = 2,
+  mode?: number,
 ): Promise<void> {
-  await writeAtomic(file, JSON.stringify(value, null, space));
+  await writeAtomic(
+    file,
+    JSON.stringify(value, null, space),
+    mode !== undefined ? { encoding: "utf8", mode } : undefined,
+  );
 }
 
 async function writeAtomic(

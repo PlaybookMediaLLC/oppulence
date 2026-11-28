@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "child_process";
 import { Writable, Readable } from "node:stream";
 import fs from "fs/promises";
+import path from "node:path";
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -19,6 +20,11 @@ import {
 import type { CodingAgent, CodeRunEvent } from "./types.js";
 import type { PermissionBroker } from "./permission-broker.js";
 import { getAgentLaunchSpec } from "./agents.js";
+import {
+  canonicalizePath,
+  isPathInsideDir,
+  isProtectedWorkspacePath,
+} from "../../config/security.js";
 
 export interface AcpClientOptions {
   agent: CodingAgent;
@@ -189,6 +195,7 @@ export class AcpClient {
       parts.length
         ? `${base} — ${parts.join(" | ")} [during ${phase}]`
         : `${base} [during ${phase}]`,
+      { cause: err },
     );
   }
 
@@ -223,12 +230,38 @@ export class AcpClient {
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
         this.onEvent(toEvent(params.update));
       },
-      async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-        const content = await fs.readFile(params.path, "utf8");
+      readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
+        const canonicalCwd = await canonicalizePath(this.cwd);
+        const target = path.isAbsolute(params.path)
+          ? params.path
+          : path.resolve(canonicalCwd, params.path);
+        const canonical = await canonicalizePath(target);
+        if (!isPathInsideDir(canonicalCwd, canonical)) {
+          throw new Error(`Access denied: ${params.path} is outside the coding session directory.`);
+        }
+        if (isProtectedWorkspacePath(canonical, "read")) {
+          throw new Error(`Access denied: ${params.path} is a protected workspace path.`);
+        }
+        const content = await fs.readFile(canonical, "utf8");
         return { content };
       },
-      async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-        await fs.writeFile(params.path, params.content);
+      writeTextFile: async (params: WriteTextFileRequest): Promise<WriteTextFileResponse> => {
+        const canonicalCwd = await canonicalizePath(this.cwd);
+        const target = path.isAbsolute(params.path)
+          ? params.path
+          : path.resolve(canonicalCwd, params.path);
+        const existingStat = await fs.lstat(target).catch(() => null);
+        if (existingStat?.isSymbolicLink()) {
+          throw new Error(`Access denied: refusing to write through symbolic link ${params.path}.`);
+        }
+        const canonical = await canonicalizePath(target);
+        if (!isPathInsideDir(canonicalCwd, canonical)) {
+          throw new Error(`Access denied: ${params.path} is outside the coding session directory.`);
+        }
+        if (isProtectedWorkspacePath(canonical, "write")) {
+          throw new Error(`Access denied: ${params.path} is a protected workspace path.`);
+        }
+        await fs.writeFile(canonical, params.content);
         return {};
       },
     };

@@ -7,6 +7,7 @@ import path from 'path';
 import * as files from '../filesystem/files.js';
 import { capture } from '../analytics/posthog.js';
 import { WorkDir } from '../config/config.js';
+import { isPathInsideDir, isProtectedWorkspacePath } from '../config/security.js';
 import { indexDir, loadMemoryConfig } from './config.js';
 import { embedBatch, isOnDeviceModel, resolveEmbedModel, resolveEmbedTarget } from './embed.js';
 import { isLocalEmbedModel } from './ollama.js';
@@ -168,7 +169,33 @@ async function grepFallback(query: string, pathPrefix: string | undefined, k: nu
         .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
         .filter((t) => t.length > 0);
     if (terms.length === 0) return [];
-    const searchPath = pathPrefix ? path.posix.join('knowledge', pathPrefix) : 'knowledge';
+    let searchPath = 'knowledge';
+    if (pathPrefix && pathPrefix.trim()) {
+        const rawPrefix = pathPrefix.trim();
+        const normalizedPrefix = rawPrefix.replace(/\\/g, '/').replace(/^\/+/, '');
+        if (
+            path.isAbsolute(rawPrefix)
+            || /^[A-Za-z]:/.test(rawPrefix)
+            || rawPrefix.startsWith('~')
+            || normalizedPrefix.split('/').includes('..')
+        ) {
+            return [];
+        }
+        const resolvedKnowledge = path.resolve(knowledgeDir());
+        const resolvedTarget = path.resolve(resolvedKnowledge, normalizedPrefix);
+        if (!isPathInsideDir(resolvedKnowledge, resolvedTarget)) {
+            return [];
+        }
+        const canonicalKnowledge = await fs.promises.realpath(resolvedKnowledge).catch(() => resolvedKnowledge);
+        const canonicalTarget = await fs.promises.realpath(resolvedTarget).catch(() => resolvedTarget);
+        if (
+            !isPathInsideDir(canonicalKnowledge, canonicalTarget)
+            || isProtectedWorkspacePath(canonicalTarget, 'search')
+        ) {
+            return [];
+        }
+        searchPath = path.posix.join('knowledge', normalizedPrefix);
+    }
     try {
         const res = await files.grep({ pattern: terms.join('|'), searchPath, fileGlob: '**/*.md', maxResults: k });
         return res.matches.map((m) => ({
