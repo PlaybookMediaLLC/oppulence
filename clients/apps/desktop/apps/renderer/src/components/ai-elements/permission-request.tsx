@@ -74,8 +74,7 @@ export const PermissionRequest = ({
   const argObj = getRecordArgs(toolCall.arguments);
   const isCodeAgentRun = toolCall.toolName === "code_agent_run";
   const isBackgroundTaskTool =
-    toolCall.toolName === "create-background-task" ||
-    toolCall.toolName === "patch-background-task";
+    toolCall.toolName === "create-background-task" || toolCall.toolName === "patch-background-task";
   const isSaveToMemory = toolCall.toolName === "save-to-memory";
 
   // Extract command ONLY for executeCommand (or generic command tools other than code_agent_run)
@@ -106,24 +105,22 @@ export const PermissionRequest = ({
     ) {
       return null;
     }
-    const match = command.match(/^\s*acpx\s+(?:--?\S+\s+)*(claude|codex)\s+exec\b/);
-    if (!match) return null;
-    return match[1] === "claude" ? "claude" : match[1] === "codex" ? "codex" : null;
+    const tokens = command.trim().split(/\s+/);
+    if (tokens[0] !== "acpx") return null;
+    let idx = 1;
+    while (idx < tokens.length && tokens[idx].startsWith("-")) {
+      idx += 1;
+    }
+    if (tokens[idx + 1] !== "exec") return null;
+    const agent = tokens[idx];
+    return agent === "claude" ? "claude" : agent === "codex" ? "codex" : null;
   })();
   const otherAgent: "claude" | "codex" | null =
     acpxAgent === "claude" ? "codex" : acpxAgent === "codex" ? "claude" : null;
   const agentDisplay =
-    acpxAgent === "claude"
-      ? "Claude Code"
-      : acpxAgent === "codex"
-        ? "Codex"
-        : null;
+    acpxAgent === "claude" ? "Claude Code" : acpxAgent === "codex" ? "Codex" : null;
   const otherDisplay =
-    otherAgent === "claude"
-      ? "Claude Code"
-      : otherAgent === "codex"
-        ? "Codex"
-        : null;
+    otherAgent === "claude" ? "Claude Code" : otherAgent === "codex" ? "Codex" : null;
 
   let hasHiddenChars = false;
   const safe = (value: string): string => {
@@ -155,10 +152,7 @@ export const PermissionRequest = ({
       )
     : null;
   const safeCodeCwd = isCodeAgentRun
-    ? safe(
-        commandPermission?.cwd ||
-          (typeof argObj?.cwd === "string" ? argObj.cwd : "."),
-      )
+    ? safe(commandPermission?.cwd || (typeof argObj?.cwd === "string" ? argObj.cwd : "."))
     : null;
   const safeCodePrompt =
     isCodeAgentRun && typeof argObj?.prompt === "string"
@@ -176,15 +170,12 @@ export const PermissionRequest = ({
       ? safe(JSON.stringify(mcpPermission.args))
       : null;
   const safeMcpUrl = mcpPermission?.url ? safe(mcpPermission.url) : null;
-  const safeMcpEnvEntries:
-    | Array<{ key: string; value: string; dangerous: boolean }>
-    | undefined = mcpPermission?.envEntries?.map(
-    (entry: { key: string; value: string; dangerous: boolean }) => ({
+  const safeMcpEnvEntries: Array<{ key: string; value: string; dangerous: boolean }> | undefined =
+    mcpPermission?.envEntries?.map((entry: { key: string; value: string; dangerous: boolean }) => ({
       key: safe(entry.key),
       value: safe(entry.value),
       dangerous: entry.dangerous,
-    }),
-  );
+    }));
   const safeMcpEnvKeys =
     mcpPermission?.envKeys && mcpPermission.envKeys.length > 0
       ? safe(mcpPermission.envKeys.join(", "))
@@ -304,10 +295,7 @@ export const PermissionRequest = ({
           )}
           <div className="flex-1 space-y-2">
             <div
-              className={cn(
-                "flex items-center gap-2",
-                isResponded && "cursor-pointer select-none",
-              )}
+              className={cn("flex items-center gap-2", isResponded && "cursor-pointer select-none")}
               onClick={isResponded ? () => setExpanded((v) => !v) : undefined}
             >
               <div className="flex-1">
@@ -320,9 +308,7 @@ export const PermissionRequest = ({
                 </h3>
                 <p className="text-sm text-muted-foreground mt-1">
                   {isResponded ? "Requested:" : "The agent wants to execute:"}{" "}
-                  <span className="font-mono font-medium">
-                    {safeToolName}
-                  </span>
+                  <span className="font-mono font-medium">{safeToolName}</span>
                   {agentDisplay && (
                     <Badge
                       variant="secondary"
@@ -345,8 +331,9 @@ export const PermissionRequest = ({
             </div>
             {showDetails && hasHiddenChars && (
               <div className="rounded-none border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                Warning: This request contains hidden, control, or bidirectional Unicode characters (escaped as{" "}
-                <code className="font-mono">[U+XXXX]</code>). Review carefully before approving.
+                Warning: This request contains hidden, control, or bidirectional Unicode characters
+                (escaped as <code className="font-mono">[U+XXXX]</code>). Review carefully before
+                approving.
               </div>
             )}
             {showDetails && isCodeAgentRun && (
@@ -469,7 +456,7 @@ export const PermissionRequest = ({
                         ? toolCall.toolName === "create-background-task"
                           ? "Create scheduled background task"
                           : "Update scheduled background task"
-                        : fileActionLabels[filePermission.operation] ?? filePermission.operation}
+                        : (fileActionLabels[filePermission.operation] ?? filePermission.operation)}
                   </p>
                 </div>
                 <div>
@@ -581,7 +568,10 @@ export const PermissionRequest = ({
                     </p>
                     <div className="space-y-1">
                       {safeMcpEnvEntries.map((entry, idx) => (
-                        <div key={idx} className="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+                        <div
+                          key={idx}
+                          className="flex flex-wrap items-center gap-1.5 text-xs font-mono"
+                        >
                           {entry.dangerous && (
                             <Badge variant="destructive" className="text-[10px] px-1 py-0">
                               Exec override
@@ -642,7 +632,8 @@ export const PermissionRequest = ({
                       Approval Scope
                     </p>
                     <p className="text-xs text-foreground">
-                      Pinned to this exact server command, arguments, and environment ({mcpPermission.configDigest.slice(0, 12)}…)
+                      Pinned to this exact server command, arguments, and environment (
+                      {mcpPermission.configDigest.slice(0, 12)}…)
                     </p>
                   </div>
                 )}
@@ -673,10 +664,7 @@ export const PermissionRequest = ({
                 size="sm"
                 onClick={onApprove}
                 disabled={isProcessing}
-                className={cn(
-                  "flex-1",
-                  canGrantScope && "rounded-r-none",
-                )}
+                className={cn("flex-1", canGrantScope && "rounded-r-none")}
               >
                 <CheckIcon className="size-4" />
                 Approve
@@ -697,9 +685,7 @@ export const PermissionRequest = ({
                     <DropdownMenuItem onClick={onApproveSession}>
                       Allow for Session
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={onApproveAlways}>
-                      Always Allow
-                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={onApproveAlways}>Always Allow</DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               )}
