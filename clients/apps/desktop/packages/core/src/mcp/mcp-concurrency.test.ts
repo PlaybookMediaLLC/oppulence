@@ -20,6 +20,10 @@ const state = vi.hoisted(() => ({
   mutateDuringPrivilegedInitialize: false,
 }));
 
+vi.mock("node:dns/promises", () => ({
+  lookup: vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]),
+}));
+
 vi.mock("../di/container.js", () => ({
   default: {
     resolve: () => ({

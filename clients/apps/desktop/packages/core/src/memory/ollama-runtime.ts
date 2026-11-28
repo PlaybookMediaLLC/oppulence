@@ -15,16 +15,26 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { z } from "zod";
 import { WorkDir } from "../config/config.js";
+import { isPathInsideDir } from "../config/security.js";
+import { writeJsonAtomic } from "../filesystem/atomic_write.js";
 import { loadMemoryConfig } from "./config.js";
 
 const execFileAsync = promisify(execFile);
+
+const BinaryChecksumManifestSchema = z.object({
+  version: z.string().min(1),
+  archiveSha256: z.string().min(1),
+  binarySha256: z.string().regex(/^[0-9a-f]{64}$/),
+  libraryChecksums: z.record(z.string(), z.string().regex(/^[0-9a-f]{64}$/)).optional(),
+});
 
 /**
  * The pinned runtime. `sha256` was verified by downloading this exact asset and
@@ -61,6 +71,106 @@ function modelsDir(): string {
 
 function binaryPath(): string {
   return path.join(runtimeDir(), "ollama");
+}
+
+function binaryChecksumPath(dir: string = runtimeDir()): string {
+  return path.join(dir, ".binary-sha256.json");
+}
+
+async function computeFileSha256(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk: Buffer | string) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", () => resolve());
+  });
+  return hash.digest("hex");
+}
+
+async function hashSharedLibraries(
+  dir: string,
+  rootDir: string = dir,
+): Promise<Record<string, string>> {
+  const checksums: Record<string, string> = {};
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    const st = await fs.lstat(full);
+    if (st.isSymbolicLink()) {
+      if (entry.name.endsWith(".dylib") || entry.name.endsWith(".so") || entry.isDirectory()) {
+        throw new Error(`Refusing unexpected symbolic link in Ollama runtime: ${entry.name}`);
+      }
+      continue;
+    }
+    if (st.isDirectory()) {
+      const nested = await hashSharedLibraries(full, rootDir);
+      Object.assign(checksums, nested);
+      continue;
+    }
+    if (!entry.name.endsWith(".dylib") && !entry.name.endsWith(".so")) continue;
+    if (!st.isFile()) {
+      throw new Error(`Refusing unexpected non-regular library: ${entry.name}`);
+    }
+    const relKey = path.relative(rootDir, full).replace(/\\/g, "/");
+    checksums[relKey] = await computeFileSha256(full);
+  }
+  return checksums;
+}
+
+async function verifyInstalledBinary(): Promise<boolean> {
+  const bin = binaryPath();
+  const dir = runtimeDir();
+  try {
+    const dirStat = await fs.lstat(dir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      return false;
+    }
+    const stat = await fs.lstat(bin);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      return false;
+    }
+    const canonicalWorkDir = await fs.realpath(WorkDir);
+    const canonicalDir = await fs.realpath(dir);
+    const canonicalBin = await fs.realpath(bin);
+    if (
+      !isPathInsideDir(canonicalWorkDir, canonicalDir) ||
+      !isPathInsideDir(canonicalDir, canonicalBin)
+    ) {
+      return false;
+    }
+    const manifestPath = binaryChecksumPath(dir);
+    const manifestStat = await fs.lstat(manifestPath);
+    if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) {
+      return false;
+    }
+    const manifestRaw = await fs.readFile(manifestPath, "utf8");
+    const parsed = BinaryChecksumManifestSchema.safeParse(JSON.parse(manifestRaw));
+    if (
+      !parsed.success ||
+      parsed.data.version !== RUNTIME.version ||
+      parsed.data.archiveSha256 !== RUNTIME.sha256
+    ) {
+      return false;
+    }
+    const actualSha256 = await computeFileSha256(canonicalBin);
+    if (actualSha256 !== parsed.data.binarySha256) {
+      return false;
+    }
+    const expectedLibs = parsed.data.libraryChecksums ?? {};
+    const actualLibs = await hashSharedLibraries(canonicalDir);
+    const actualKeys = Object.keys(actualLibs).sort();
+    const expectedKeys = Object.keys(expectedLibs).sort();
+    if (
+      actualKeys.length !== expectedKeys.length ||
+      actualKeys.some((k, idx) => k !== expectedKeys[idx] || actualLibs[k] !== expectedLibs[k])
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** True when this platform gets an auto-provisioned runtime. See the file header. */
@@ -113,7 +223,7 @@ export async function installRuntime(): Promise<boolean> {
   if (installInFlight) return installInFlight;
   installInFlight = (async () => {
     const dest = runtimeDir();
-    if (await exists(binaryPath())) return true;
+    if ((await exists(binaryPath())) && (await verifyInstalledBinary())) return true;
 
     const parent = path.dirname(dest);
     await fs.mkdir(parent, { recursive: true });
@@ -151,9 +261,24 @@ export async function installRuntime(): Promise<boolean> {
       // System tar rather than a new dependency; darwin always has /usr/bin/tar,
       // and this path is darwin-only by construction.
       await execFileAsync("/usr/bin/tar", ["-xzf", archive, "-C", staging]);
-      await fs.chmod(path.join(staging, "ollama"), 0o755);
+      const stagedBinary = path.join(staging, "ollama");
+      await fs.chmod(stagedBinary, 0o755);
+      const binarySha256 = await computeFileSha256(stagedBinary);
+      const libraryChecksums = await hashSharedLibraries(staging);
+      await writeJsonAtomic(
+        binaryChecksumPath(staging),
+        {
+          version: RUNTIME.version,
+          archiveSha256: RUNTIME.sha256,
+          binarySha256,
+          libraryChecksums,
+        },
+        2,
+        0o600,
+      );
 
       // Atomic swap: a half-extracted tree must never be visible at `dest`.
+      await fs.rm(dest, { recursive: true, force: true });
       await fs.rename(staging, dest);
       console.log(`[Memory] Local embedding runtime installed.`);
       return true;
@@ -206,6 +331,12 @@ async function startManaged(): Promise<boolean> {
     if (await daemonResponds(managedURL)) return true; // ours from a previous tick
 
     if (!(await exists(binaryPath()))) return false;
+    if (!(await verifyInstalledBinary())) {
+      console.warn(
+        "[Memory] Managed Ollama binary failed integrity verification; refusing to spawn.",
+      );
+      return false;
+    }
     // Everything from here can throw — mkdir on a full disk, spawn on a
     // corrupt binary — and this module promises the caller a boolean, not an
     // exception. A rejection propagates through ensureOllamaRuntime and

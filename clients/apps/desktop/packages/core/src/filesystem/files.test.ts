@@ -201,4 +201,54 @@ describe("filesystem files", () => {
       }),
     ]);
   });
+
+  it("excludes config/ from workspace-root glob and grep scans", async () => {
+    const files = await loadFiles();
+    await fs.mkdir(path.join(workspaceDir, "config"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "knowledge"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspaceDir, "config", "oauth.json"),
+      '{"access_token":"super-secret"}\n',
+      "utf8",
+    );
+    await fs.writeFile(path.join(workspaceDir, "knowledge", "note.md"), "super-secret\n", "utf8");
+
+    const globResult = await files.glob("**/*", ".");
+    expect(globResult.files).not.toContain("config/oauth.json");
+    expect(globResult.files).toContain("knowledge/note.md");
+
+    const grepResult = await files.grep({ pattern: "super-secret", searchPath: "." });
+    expect(grepResult.matches.map((m) => m.file)).toEqual(["knowledge/note.md"]);
+
+    // Partial-segment glob like `config*/*` must NOT disable protected filtering
+    const partialGlob = await files.glob("config*/*", ".");
+    expect(partialGlob.files).toEqual([]);
+    const partialGrep = await files.grep({
+      pattern: "super-secret",
+      searchPath: ".",
+      fileGlob: "config*/*",
+    });
+    expect(partialGrep.matches).toEqual([]);
+  });
+
+  it("filters protected subtrees in files.list and refuses symlink copy/non-atomic write", async () => {
+    const files = await loadFiles();
+    await fs.mkdir(path.join(workspaceDir, "config"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "knowledge"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "config", "oauth.json"), '{"t":"s"}', "utf8");
+    await fs.writeFile(path.join(workspaceDir, "knowledge", "note.md"), "ok", "utf8");
+
+    const listed = await files.list(".", { recursive: true });
+    expect(listed.some((e) => e.path.includes("config/oauth.json"))).toBe(false);
+    expect(listed.some((e) => e.path.includes("knowledge/note.md"))).toBe(true);
+
+    const danglingDest = path.join(workspaceDir, "knowledge", "dangling-link.txt");
+    await fs.symlink(path.join(workspaceDir, "knowledge", "missing.txt"), danglingDest);
+    await expect(files.copy("knowledge/note.md", "knowledge/dangling-link.txt", true)).rejects.toThrow(
+      /symbolic link/i,
+    );
+    await expect(
+      files.writeText("knowledge/dangling-link.txt", "overwrite", { atomic: false }),
+    ).rejects.toThrow(/symbolic link/i);
+  });
 });

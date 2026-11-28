@@ -1,13 +1,10 @@
 import { withFileLock } from "../knowledge/file-lock.js";
 import { writeJsonAtomic } from "../filesystem/atomic_write.js";
 import { WorkDir } from "../config/config.js";
-import { McpServerConfig, McpServerDefinition } from "@x/shared/mcp";
+import { McpServerConfig, McpServerDefinition, McpServerName } from "@x/shared/mcp";
 import path from "path";
 import z from "zod";
 import { ensureJsonConfig, readJsonConfig } from "../config/json_config.js";
-
-const DEFAULT_MCP_SERVERS = {
-};
 
 export interface IMcpConfigRepo {
     ensureConfig(): Promise<void>;
@@ -18,7 +15,7 @@ export interface IMcpConfigRepo {
     delete(serverName: string): Promise<void>;
 }
 
-const defaults = (): z.infer<typeof McpServerConfig> => ({ mcpServers: DEFAULT_MCP_SERVERS });
+const defaults = (): z.infer<typeof McpServerConfig> => ({ mcpServers: {} });
 
 export class FSMcpConfigRepo implements IMcpConfigRepo {
     private readonly configPath = path.join(WorkDir, "config", "mcp.json");
@@ -57,12 +54,14 @@ export class FSMcpConfigRepo implements IMcpConfigRepo {
     // rowboat-configure-integration-mcp), so two agent runs can race, and each
     // rewrites the whole server map from a value it read first.
     async upsert(serverName: string, config: z.infer<typeof McpServerDefinition>): Promise<void> {
+        const validatedName = McpServerName.parse(serverName);
+        const validatedConfig = McpServerDefinition.parse(config);
         return withFileLock(this.configPath, async () => {
             const conf = await this.getConfig();
-            conf.mcpServers[serverName] = config;
+            conf.mcpServers[validatedName] = validatedConfig;
             // Atomic: a torn mcp.json reads as defaults — every server gone.
-            await writeJsonAtomic(this.configPath, conf);
-            this.getGeneration(serverName, config);
+            await writeJsonAtomic(this.configPath, conf, 2, 0o600);
+            this.getGeneration(validatedName, validatedConfig);
         });
     }
 
@@ -70,7 +69,7 @@ export class FSMcpConfigRepo implements IMcpConfigRepo {
         return withFileLock(this.configPath, async () => {
             const conf = await this.getConfig();
             delete conf.mcpServers[serverName];
-            await writeJsonAtomic(this.configPath, conf);
+            await writeJsonAtomic(this.configPath, conf, 2, 0o600);
             this.generations.delete(serverName);
             this.nextGeneration += 1;
         });

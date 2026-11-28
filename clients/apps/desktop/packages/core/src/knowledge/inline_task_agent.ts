@@ -1,10 +1,10 @@
-import { BuiltinTools } from '../application/lib/builtin-tools.js';
+import { BuiltinTools, HEADLESS_EXCLUDED_TOOLS } from '../application/lib/builtin-tools.js';
 
 export function getRaw(): string {
-  // code_agent_run needs an interactive UI to answer its permission asks; exclude it
-  // from this headless agent so it can't hang waiting on an approval no one can give.
+  // Exclude interactive, shell, MCP-mutating, and recursive headless tools so
+  // inline_task_agent cannot execute arbitrary commands or persist MCP/bg-tasks.
   const toolEntries = Object.keys(BuiltinTools)
-    .filter(name => name !== 'code_agent_run')
+    .filter(name => !HEADLESS_EXCLUDED_TOOLS.has(name))
     .map(name => `  ${name}:\n    type: builtin\n    name: ${name}`)
     .join('\n');
 

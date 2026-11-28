@@ -162,7 +162,7 @@ export function createObservedMcpFetch(
         }),
       );
     }
-    return fetchImpl(input, init);
+    return fetchImpl(input, { ...init, redirect: "error" });
   };
 }
 
@@ -176,7 +176,7 @@ export function createOneShotApprovalFetch(options: {
   let consumed = false;
   return async (input, init) => {
     const toolCall = parseToolCallBody(requestBody(input, init));
-    if (!toolCall) return options.fetchImpl(input, init);
+    if (!toolCall) return options.fetchImpl(input, { ...init, redirect: "error" });
     if (consumed)
       throw new Error("The one-time MCP approval token was already applied to its request.");
 

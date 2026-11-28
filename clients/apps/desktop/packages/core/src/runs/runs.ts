@@ -8,8 +8,16 @@ import { IBus } from "../application/lib/bus.js";
 import { IAbortRegistry } from "./abort-registry.js";
 import { IRunsLock } from "./lock.js";
 import { forceCloseAllMcpClients } from "../mcp/mcp.js";
-import { extractCommandNames } from "../application/lib/command-executor.js";
-import { addFileAccessGrant, addToSecurityConfig } from "../config/security.js";
+import {
+    extractCommandNames,
+    isAlwaysRequireApprovalCommand,
+} from "../application/lib/command-executor.js";
+import {
+    addFileAccessGrant,
+    addMcpServerGrant,
+    addToSecurityConfig,
+} from "../config/security.js";
+import { withFileLock } from "../knowledge/file-lock.js";
 import { loadAgent } from "../agents/runtime.js";
 import { getDefaultModelAndProvider } from "../models/defaults.js";
 
@@ -50,50 +58,137 @@ export async function createMessage(runId: string, message: UserMessageContentTy
 
 export async function authorizePermission(runId: string, ev: z.infer<typeof ToolPermissionAuthorizePayload>): Promise<void> {
     const { scope, ...rest } = ev;
+    const repo = container.resolve<IRunsRepo>('runsRepo');
+    const targetSubflow = JSON.stringify(rest.subflow);
 
-    // For "always" scope, derive command from the run log and persist to security config
-    if (rest.response === "approve" && scope === "always") {
-        const repo = container.resolve<IRunsRepo>('runsRepo');
+    const committed = await withFileLock(`run-permission:${runId}`, async () => {
         const run = await repo.fetch(runId);
         const permReqEvent = run.log.find(
             (e): e is z.infer<typeof ToolPermissionRequestEvent> =>
                 e.type === "tool-permission-request"
                 && e.toolCall.toolCallId === rest.toolCallId
-                && JSON.stringify(e.subflow) === JSON.stringify(rest.subflow)
+                && JSON.stringify(e.subflow) === targetSubflow
         );
-        if (permReqEvent?.permission?.kind === "file") {
-            await addFileAccessGrant({
-                operation: permReqEvent.permission.operation,
-                pathPrefix: permReqEvent.permission.pathPrefix,
-            });
-        } else if (permReqEvent && typeof permReqEvent.toolCall.arguments === 'object' && permReqEvent.toolCall.arguments !== null && 'command' in permReqEvent.toolCall.arguments) {
-            const commandNames = extractCommandNames(String(permReqEvent.toolCall.arguments.command));
-            if (commandNames.length > 0) {
-                await addToSecurityConfig(commandNames);
+        if (!permReqEvent) {
+            throw new Error(`No matching permission request found for toolCallId ${rest.toolCallId}`);
+        }
+
+        const alreadyResponded = run.log.some(
+            (e) =>
+                e.type === "tool-permission-response"
+                && e.toolCallId === rest.toolCallId
+                && JSON.stringify(e.subflow) === targetSubflow
+        );
+        if (alreadyResponded) {
+            return null;
+        }
+
+        const permission = permReqEvent.permission;
+        const canGrantScope = permission?.allowScopeGrant === true;
+        const effectiveScope = canGrantScope ? scope : "once";
+
+        // Commit the run log response FIRST while holding the per-run lock so a
+        // racing deny/approve pair can never persist an "always" grant after deny won.
+        const event: z.infer<typeof ToolPermissionResponseEvent> = {
+            ...rest,
+            runId,
+            type: "tool-permission-response",
+            scope: effectiveScope,
+        };
+        await repo.appendEvents(runId, [event]);
+
+        return { permReqEvent, permission, effectiveScope };
+    });
+
+    if (!committed) {
+        return;
+    }
+
+    // For "always" scope, derive grant from the verified request metadata and persist to security config
+    if (rest.response === "approve" && committed.effectiveScope === "always" && committed.permission) {
+        const { permission, permReqEvent } = committed;
+        switch (permission.kind) {
+            case "file": {
+                await addFileAccessGrant({
+                    operation: permission.operation,
+                    pathPrefix: permission.pathPrefix,
+                });
+                break;
+            }
+            case "mcp": {
+                if (
+                    permission.action === "spawn"
+                    && permission.configDigest
+                    && permission.command
+                ) {
+                    await addMcpServerGrant({
+                        serverName: permission.serverName,
+                        configDigest: permission.configDigest,
+                        command: permission.command,
+                        args: permission.args,
+                    });
+                }
+                break;
+            }
+            case "command": {
+                const rawNames = permission.commandNames.length > 0
+                    ? permission.commandNames
+                    : (typeof permReqEvent.toolCall.arguments === 'object'
+                        && permReqEvent.toolCall.arguments !== null
+                        && 'command' in permReqEvent.toolCall.arguments
+                        ? extractCommandNames(String(permReqEvent.toolCall.arguments.command))
+                        : []);
+                const commandNames = rawNames.filter((name) => !isAlwaysRequireApprovalCommand(name));
+                if (commandNames.length > 0) {
+                    await addToSecurityConfig(commandNames);
+                }
+                break;
+            }
+            default: {
+                const unhandled: never = permission;
+                throw new Error(`Unhandled permission kind: ${String(unhandled)}`);
             }
         }
     }
 
-    const repo = container.resolve<IRunsRepo>('runsRepo');
-    const event: z.infer<typeof ToolPermissionResponseEvent> = {
-        ...rest,
-        runId,
-        type: "tool-permission-response",
-        scope,
-    };
-    await repo.appendEvents(runId, [event]);
     const runtime = container.resolve<IAgentRuntime>('agentRuntime');
     runtime.trigger(runId);
 }
 
 export async function replyToHumanInputRequest(runId: string, ev: z.infer<typeof AskHumanResponsePayload>): Promise<void> {
     const repo = container.resolve<IRunsRepo>('runsRepo');
-    const event: z.infer<typeof AskHumanResponseEvent> = {
-        ...ev,
-        runId,
-        type: "ask-human-response",
-    };
-    await repo.appendEvents(runId, [event]);
+    const targetSubflow = JSON.stringify(ev.subflow);
+    const appended = await withFileLock(`run-ask-human:${runId}`, async () => {
+        const run = await repo.fetch(runId);
+        const matchingRequest = run.log.some(
+            (e) =>
+                e.type === "ask-human-request"
+                && e.toolCallId === ev.toolCallId
+                && JSON.stringify(e.subflow) === targetSubflow
+        );
+        if (!matchingRequest) {
+            throw new Error(`No matching ask-human request found for toolCallId ${ev.toolCallId}`);
+        }
+        const alreadyResponded = run.log.some(
+            (e) =>
+                e.type === "ask-human-response"
+                && e.toolCallId === ev.toolCallId
+                && JSON.stringify(e.subflow) === targetSubflow
+        );
+        if (alreadyResponded) {
+            return false;
+        }
+        const event: z.infer<typeof AskHumanResponseEvent> = {
+            ...ev,
+            runId,
+            type: "ask-human-response",
+        };
+        await repo.appendEvents(runId, [event]);
+        return true;
+    });
+    if (!appended) {
+        return;
+    }
     const runtime = container.resolve<IAgentRuntime>('agentRuntime');
     runtime.trigger(runId);
 }

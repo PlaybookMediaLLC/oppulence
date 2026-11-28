@@ -23,4 +23,5 @@ export * as meetings from "./meetings.js";
 export * as calendar from "./calendar.js";
 export * as emailDomain from "./email-domain.js";
 export * as relationships from "./relationships.js";
+export * as security from "./security.js";
 export { PrefixLogger };

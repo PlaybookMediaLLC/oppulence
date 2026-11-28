@@ -276,9 +276,10 @@ export async function awaitApprovalAndRetry(
   } catch {
     throw new Error("The product returned an invalid approval URL.");
   }
+  const approvalHost = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (
     url.protocol !== "https:" &&
-    !(url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname))
+    !(url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(approvalHost))
   )
     throw new Error("The product returned an unsafe approval URL.");
   const productOrigin = requestBinding?.endpoint.origin;

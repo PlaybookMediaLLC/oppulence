@@ -1023,6 +1023,12 @@ const ipcSchemas = {
       ),
     }),
   },
+  "search:isExaConfigured": {
+    req: z.null(),
+    res: z.object({
+      configured: z.boolean(),
+    }),
+  },
   // Semantic memory channels (RFC 021)
   "memory:search": {
     req: z.object({

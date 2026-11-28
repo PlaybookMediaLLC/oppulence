@@ -288,9 +288,10 @@ export function parseConnectorStartResponse(value: unknown): {
   const authorizationUrl = body.authorization_url ?? body.authorizationUrl ?? body.authorize_url;
   if (!authorizationUrl) throw new Error("connector start returned no authorization_url");
   const url = new URL(authorizationUrl);
+  const authHost = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (
     url.protocol !== "https:" &&
-    !(url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname))
+    !(url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(authHost))
   )
     throw new Error("connector start returned an unsafe authorization URL");
   return { authorizationUrl, expiresAt: body.expires_at ?? body.expiresAt };
@@ -365,6 +366,19 @@ export async function authorizeConnectorScopesViaBackend(
   if (!res.ok)
     throw new Error(`connector authorization failed: ${res.status} ${await readError(res)}`.trim());
 }
+function isLoopbackHttpUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return (
+      parsed.protocol === "http:" &&
+      (host === "localhost" || host === "127.0.0.1" || host === "::1")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function getConnectorMCPTokenViaBackend(
   connector: string,
 ): Promise<ConnectorMCPTokenResponse> {
@@ -388,11 +402,36 @@ export async function getConnectorMCPTokenViaBackend(
     .parse(await res.json());
   const mcpUrl = body.mcpUrl ?? body.mcp_url;
   if (!mcpUrl) throw new Error("connector mcp token returned no mcpUrl");
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(mcpUrl);
+  } catch (err) {
+    throw new Error("connector mcp token returned an invalid mcpUrl", { cause: err });
+  }
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("connector mcp token returned an mcpUrl with embedded credentials");
+  }
+  const allowDevLoopbackHttp = isLoopbackHttpUrl(API_URL) && isLoopbackHttpUrl(parsedUrl.toString());
+  if (parsedUrl.protocol !== "https:" && !allowDevLoopbackHttp) {
+    throw new Error("connector mcp token returned an insecure non-HTTPS mcpUrl");
+  }
+  const host = parsedUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+  if (
+    host === "metadata.google.internal" ||
+    host === "metadata.goog" ||
+    host === "instance-data" ||
+    host.startsWith("169.254.") ||
+    host === "100.100.100.200" ||
+    host === "fd00:ec2::254" ||
+    (!allowDevLoopbackHttp && (host === "localhost" || host.endsWith(".localhost") || host === "127.0.0.1" || host === "::1"))
+  ) {
+    throw new Error("connector mcp token returned a disallowed metadata or loopback mcpUrl");
+  }
   return {
     access_token: body.access_token,
     token_type: body.token_type,
     expires_at: body.expires_at,
-    mcpUrl,
+    mcpUrl: parsedUrl.toString(),
     connectionId: body.connectionId ?? body.connection_id,
   };
 }

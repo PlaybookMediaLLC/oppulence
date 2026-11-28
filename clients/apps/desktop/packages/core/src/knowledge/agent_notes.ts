@@ -89,8 +89,7 @@ export function findUserSentEmails(state: AgentNotesState, userEmail: string, li
     if (results.length >= limit) break;
     try {
       const content = fs.readFileSync(candidate.path, "utf-8");
-      const fromLines = content.match(/^### From:.*$/gm);
-      if (fromLines?.some((line) => line.toLowerCase().includes(userEmailLower))) {
+      if (extractUserPartsFromEmail(content, userEmailLower) !== null) {
         results.push(candidate.path);
       }
     } catch {
@@ -100,16 +99,53 @@ export function findUserSentEmails(state: AgentNotesState, userEmail: string, li
   return results;
 }
 
-function extractUserPartsFromEmail(content: string, userEmail: string): string | null {
-  const userEmailLower = userEmail.toLowerCase();
+/**
+ * Extract the exact RFC 5322 email address from a `### From: ...` header line.
+ * Never matches display names (e.g. `"victim@example.com" <attacker@evil.com>`
+ * resolves to `attacker@evil.com`, not `victim@example.com`).
+ */
+export function extractSenderAddress(fromLine: string): string | null {
+  const value = fromLine.replace(/^###\s+From:\s*/i, "").trim();
+  if (!value) return null;
+  const angleMatches = [...value.matchAll(/<([^<>\s]+@[^<>\s]+)>/g)];
+  if (angleMatches.length > 0) {
+    return angleMatches[angleMatches.length - 1][1].trim().toLowerCase();
+  }
+  const stripped = value.replace(/^["']+|["']+$/g, "").trim();
+  if (/^[^\s<>,"']+@[^\s<>,"']+$/.test(stripped)) {
+    return stripped.toLowerCase();
+  }
+  return null;
+}
+
+export function extractUserPartsFromEmail(content: string, userEmail: string): string | null {
+  const userEmailLower = userEmail.trim().toLowerCase();
+  if (!userEmailLower) return null;
+  const isSyncedThread = /^\*\*Thread ID:\*\*/m.test(content);
   const sections = content.split(/^---$/m);
   const userSections: string[] = [];
 
-  for (const section of sections) {
-    const fromMatch = section.match(/^### From:.*$/m);
-    if (fromMatch && fromMatch[0].toLowerCase().includes(userEmailLower)) {
-      userSections.push(section.trim());
+  for (const rawSection of sections) {
+    const trimmed = rawSection.trim();
+    if (!trimmed) continue;
+    const lines = trimmed.split(/\r?\n/);
+    const firstLine = lines[0]?.trim() ?? "";
+    if (!/^###\s+From:/i.test(firstLine)) {
+      continue;
     }
+    const sender = extractSenderAddress(firstLine);
+    if (sender !== userEmailLower) {
+      continue;
+    }
+    if (isSyncedThread) {
+      // Synced Gmail threads must carry the authenticated Gmail SENT label marker
+      // written directly in the message metadata header by sync_gmail.ts.
+      const headerWindow = lines.slice(1, 4).map((l) => l.trim());
+      if (!headerWindow.includes("**Verified Sender:** SENT")) {
+        continue;
+      }
+    }
+    userSections.push(trimmed);
   }
 
   return userSections.length > 0 ? userSections.join("\n\n---\n\n") : null;
@@ -227,7 +263,9 @@ function extractConversationMessages(runFilePath: string): { role: string; text:
         if (event.type !== "message") continue;
 
         const msg = event.message;
-        if (!msg || (msg.role !== "user" && msg.role !== "assistant")) continue;
+        // Only ingest user-authored messages so prompt-injected assistant echoes
+        // from untrusted tool outputs cannot poison Agent Notes system prompts.
+        if (!msg || msg.role !== "user") continue;
 
         let text = "";
         if (typeof msg.content === "string") {

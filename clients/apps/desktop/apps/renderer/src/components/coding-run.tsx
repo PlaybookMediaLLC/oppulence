@@ -19,6 +19,7 @@ import type {
   PermissionDecision,
 } from "@x/shared/code-mode";
 import { cn } from "@/lib/utils";
+import { sanitizeDisplayText } from "@/lib/sanitize-display";
 import { Tool, ToolContent, ToolHeader } from "@/components/ai-elements/tool";
 import { toToolState, type ToolCall } from "@/lib/chat-conversation";
 
@@ -177,7 +178,7 @@ function CodingRunTimeline({ events }: { events: CodeRunEvent[] }) {
                 )}
                 {toolKindIcon(row.toolKind)}
                 <span className="truncate text-foreground/90">
-                  {row.title ?? row.toolKind ?? "Tool call"}
+                  {sanitizeDisplayText(row.title ?? row.toolKind ?? "Tool call").text}
                 </span>
               </div>
               {row.diffs.length > 0 && (
@@ -186,9 +187,9 @@ function CodingRunTimeline({ events }: { events: CodeRunEvent[] }) {
                     <span
                       key={d}
                       className="truncate font-mono text-xs text-muted-foreground"
-                      title={d}
+                      title={sanitizeDisplayText(d).text}
                     >
-                      {basename(d)}
+                      {sanitizeDisplayText(basename(d)).text}
                     </span>
                   ))}
                 </div>
@@ -215,7 +216,7 @@ function CodingRunTimeline({ events }: { events: CodeRunEvent[] }) {
                         "text-muted-foreground line-through",
                     )}
                   >
-                    {entry.content}
+                    {sanitizeDisplayText(entry.content).text}
                   </span>
                 </div>
               ))}
@@ -235,7 +236,7 @@ function CodingRunTimeline({ events }: { events: CodeRunEvent[] }) {
           >
             {denied ? "✕" : "✓"}
             <span className="truncate">
-              {denied ? "Denied" : "Allowed"}: {row.title}
+              {denied ? "Denied" : "Allowed"}: {sanitizeDisplayText(row.title).text}
             </span>
           </div>
         );
@@ -245,6 +246,8 @@ function CodingRunTimeline({ events }: { events: CodeRunEvent[] }) {
 }
 
 // ── In-run permission card ──────────────────────────────────────────
+
+const STICKY_CODE_PERMISSION_KINDS = new Set(["read", "search", "think", "edit", "move"]);
 
 export function CodeRunPermissionRequest({
   ask,
@@ -259,6 +262,11 @@ export function CodeRunPermissionRequest({
     setBusy(true);
     onDecide(d);
   };
+  const sanitizedTitle = sanitizeDisplayText(ask.title);
+  const sanitizedKind = ask.kind ? sanitizeDisplayText(ask.kind) : null;
+  const hasHiddenChars =
+    sanitizedTitle.hasHiddenChars || Boolean(sanitizedKind?.hasHiddenChars);
+  const allowSticky = Boolean(ask.kind && STICKY_CODE_PERMISSION_KINDS.has(ask.kind));
   const btn =
     "rounded-full px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50";
   return (
@@ -269,8 +277,13 @@ export function CodeRunPermissionRequest({
       </div>
       <p className="mt-1 text-sm text-muted-foreground">
         The agent wants to:{" "}
-        <span className="font-medium text-foreground">{ask.title}</span>
+        <span className="font-medium text-foreground">{sanitizedTitle.text}</span>
       </p>
+      {hasHiddenChars && (
+        <p className="mt-1.5 text-xs text-destructive">
+          Warning: Contains hidden or bidirectional Unicode characters (escaped as [U+XXXX]).
+        </p>
+      )}
       <div className="mt-3 flex flex-wrap gap-2">
         <button
           type="button"
@@ -283,14 +296,16 @@ export function CodeRunPermissionRequest({
         >
           Allow
         </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => decide("allow_always")}
-          className={cn(btn, "border hover:bg-muted")}
-        >
-          Always allow{ask.kind ? ` (${ask.kind})` : ""}
-        </button>
+        {allowSticky && sanitizedKind && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => decide("allow_always")}
+            className={cn(btn, "border hover:bg-muted")}
+          >
+            Always allow ({sanitizedKind.text})
+          </button>
+        )}
         <button
           type="button"
           disabled={busy}
@@ -346,6 +361,7 @@ export function CodingRunBlock({
       </Tool>
       {item.pendingCodePermission && (
         <CodeRunPermissionRequest
+          key={item.pendingCodePermission.requestId}
           ask={item.pendingCodePermission.ask}
           onDecide={onPermissionDecision}
         />

@@ -1,3 +1,5 @@
+import path from 'path';
+
 export type RuntimeShellDialect = 'windows-cmd' | 'posix-sh';
 export type RuntimeOsName = 'Windows' | 'macOS' | 'Linux' | 'Unknown';
 
@@ -10,14 +12,30 @@ export interface RuntimeContext {
 
 export function getExecutionShell(platform: NodeJS.Platform = process.platform): string {
   if (platform === 'win32') {
-    return process.env.ComSpec || 'cmd.exe';
+    const rawSystemRoot = process.env.SystemRoot?.trim() || 'C:\\Windows';
+    const systemRoot = /^[a-zA-Z]:[\\/]/.test(rawSystemRoot)
+      ? path.win32.resolve(rawSystemRoot)
+      : 'C:\\Windows';
+    const defaultCmd = path.win32.join(systemRoot, 'System32', 'cmd.exe');
+    const comSpec = process.env.ComSpec?.trim();
+    if (comSpec && /^[a-zA-Z]:[\\/]/.test(comSpec)) {
+      const normalizedComSpec = path.win32.resolve(comSpec).toLowerCase();
+      const allowed = [
+        path.win32.join(systemRoot, 'System32', 'cmd.exe').toLowerCase(),
+        path.win32.join(systemRoot, 'SysWOW64', 'cmd.exe').toLowerCase(),
+        path.win32.join(systemRoot, 'Sysnative', 'cmd.exe').toLowerCase(),
+      ];
+      if (allowed.includes(normalizedComSpec)) {
+        return path.win32.resolve(comSpec);
+      }
+    }
+    return defaultCmd;
   }
 
-  if (process.env.SHELL) {
-    return process.env.SHELL;
-  }
-
-  return platform === 'darwin' ? '/bin/zsh' : '/bin/sh';
+  // Always execute POSIX commands with /bin/sh so the runtime shell matches
+  // command-executor's posix-sh parser (never inheriting fish/tcsh/zsh syntax
+  // differentials from process.env.SHELL).
+  return '/bin/sh';
 }
 
 export function getRuntimeContext(platform: NodeJS.Platform = process.platform): RuntimeContext {

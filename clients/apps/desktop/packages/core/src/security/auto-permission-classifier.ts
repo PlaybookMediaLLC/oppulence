@@ -16,15 +16,11 @@ const DecisionSchema = z.object({
 });
 
 export type AutoPermissionCandidate = {
-    toolCall: z.infer<typeof ToolCallPart>;
-    permission: z.infer<typeof ToolPermissionMetadata>;
+    readonly toolCall: z.infer<typeof ToolCallPart>;
+    readonly permission: z.infer<typeof ToolPermissionMetadata>;
 };
 
-export type AutoPermissionDecision = {
-    toolCallId: string;
-    decision: "allow" | "deny";
-    reason: string;
-};
+export type AutoPermissionDecision = z.infer<typeof DecisionSchema>["decisions"][number];
 
 const SYSTEM_PROMPT = `You decide whether a personal productivity app may run tool calls without interrupting the user.
 
@@ -33,8 +29,9 @@ You only receive tool calls that already require permission under deterministic 
 Allow a tool call only when it is clearly consistent with the user's request and low risk.
 Deny tool calls that are destructive, credential-sensitive, privacy-sensitive, broad in scope, likely irreversible, or not clearly requested.
 
-Command examples to deny unless explicitly requested: deleting data, force pushing, deploying, running migrations, changing permissions, reading secrets, exfiltrating tokens, or modifying files outside the user's workspace.
-File examples to deny unless explicitly requested: deleting paths, writing outside the workspace, reading secrets or credentials, or broad access to private directories.
+Command examples to deny unless explicitly requested: deleting data, force pushing, deploying, running migrations, changing permissions, reading secrets, dumping environment variables (env, printenv), running interpreters or shells (awk, sh, bash, python, node), using command substitution or file redirections, exfiltrating tokens, or accessing/modifying files outside the user's workspace or inside workspace config/.
+File examples to deny unless explicitly requested: deleting paths, writing outside the workspace, reading or editing workspace config/ files (oauth.json, models.json, security.json, mcp.json), reading secrets or credentials, or broad access to private directories.
+MCP examples to deny unless explicitly requested: installing or updating MCP servers (addMcpServer), or spawning local stdio MCP server processes.
 
 Return one decision for every toolCallId. Use the exact toolCallId values provided.`;
 
@@ -44,13 +41,22 @@ function compact(value: unknown, max = 8_000): string {
     return `${text.slice(0, max)}\n...<truncated>`;
 }
 
-function recentContext(messages: ModelMessage[]): unknown[] {
-    return messages.slice(-8).map((message) => {
+export function extractUserOnlyContext(messages: ModelMessage[]): unknown[] {
+    // Only include user-authored messages in the permission classifier context.
+    // Assistant turns can echo or summarize prompt injections from tool outputs,
+    // and slicing all messages by -8 could evict the real user request after a
+    // few tool turns.
+    const userMessages = messages.filter((message) => message.role === "user");
+    return userMessages.slice(-6).map((message) => {
         if (typeof message.content === "string") {
             return { role: message.role, content: compact(message.content, 2_000) };
         }
         return { role: message.role, content: compact(message.content, 3_000) };
     });
+}
+
+function recentContext(messages: ModelMessage[]): unknown[] {
+    return extractUserOnlyContext(messages);
 }
 
 function buildPrompt(input: {

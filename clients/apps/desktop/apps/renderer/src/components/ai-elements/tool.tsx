@@ -11,6 +11,7 @@ import {
   TooltipTrigger,
 } from "@oppulence/ui/components/tooltip";
 import { cn } from "@/lib/utils";
+import { sanitizeDisplayText } from "@/lib/sanitize-display";
 import type { ToolUIPart } from "ai";
 import {
   ChevronDownIcon,
@@ -47,7 +48,7 @@ const ToolCode = ({
       className
     )}
   >
-    {code || "(empty)"}
+    {code ? sanitizeDisplayText(code).text : "(empty)"}
   </pre>
 );
 
@@ -89,7 +90,7 @@ export const Tool = ({ className, children, autoPermissionDetail, ...props }: To
             </span>
           </TooltipTrigger>
           <TooltipContent side="bottom" align="end" className="max-w-sm">
-            {autoPermissionDetail.reason}
+            {sanitizeDisplayText(autoPermissionDetail.reason).text}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -123,7 +124,7 @@ export const ToolHeader = ({
   hideLeadIcon,
   ...props
 }: ToolHeaderProps) => {
-  const displayTitle = title ?? type.split("-").slice(1).join("-")
+  const displayTitle = sanitizeDisplayText(title ?? type.split("-").slice(1).join("-")).text
 
   return (
     <CollapsibleTrigger
@@ -267,12 +268,12 @@ export const ToolGroupComponent = ({ group, isToolOpen, onToolOpenChange }: Tool
   const currentTool = runningTool ?? group.items[group.items.length - 1]
   const toolCount = group.items.length
   const ranLabel = `Ran ${toolCount} tool${toolCount !== 1 ? 's' : ''}`
-  const actions = isCompleted ? getToolActionsSummary(group.items) : ''
+  const actions = isCompleted ? sanitizeDisplayText(getToolActionsSummary(group.items)).text : ''
   // Plain string used as the AnimatePresence key + tooltip; the rendered node
   // shows the action summary in a lighter gray than the "Ran N tools" prefix.
   const summaryText = isCompleted
     ? `${ranLabel} · ${actions}`
-    : currentTool ? getToolDisplayName(currentTool) : getToolGroupSummary(group.items)
+    : sanitizeDisplayText(currentTool ? getToolDisplayName(currentTool) : getToolGroupSummary(group.items)).text
   const summaryNode: ReactNode = isCompleted
     ? <>{ranLabel} <span className="font-normal text-muted-foreground">{`· ${actions}`}</span></>
     : summaryText

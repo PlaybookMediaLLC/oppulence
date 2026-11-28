@@ -21,7 +21,16 @@
 // one costs a re-configuration. Throwing on every read costs the feature.
 import { writeJsonAtomic } from "../filesystem/atomic_write.js";
 import fsp from "fs/promises";
+import path from "path";
 import type { ZodType } from "zod";
+import { WorkDir } from "./config.js";
+import { isPathInsideDir } from "./security.js";
+
+const CONFIG_DIR = path.join(WorkDir, "config");
+
+function configFileMode(filePath: string): number | undefined {
+  return isPathInsideDir(CONFIG_DIR, filePath) ? 0o600 : undefined;
+}
 
 export interface ParsedConfig<T> {
   config: T;
@@ -98,7 +107,7 @@ export async function ensureJsonConfig<T>(
   try {
     raw = await fsp.readFile(filePath, "utf8");
   } catch {
-    await writeJsonAtomic(filePath, fallback());
+    await writeJsonAtomic(filePath, fallback(), 2, configFileMode(filePath));
     return null;
   }
 
@@ -113,7 +122,7 @@ export async function ensureJsonConfig<T>(
     // replacement write itself could tear. Now the failure window is a pair of
     // renames and the write is atomic.
     const rebuilt = `${filePath}.rebuilt-${stamp}`;
-    await writeJsonAtomic(rebuilt, config);
+    await writeJsonAtomic(rebuilt, config, 2, configFileMode(filePath));
     await fsp.rename(filePath, quarantinePath);
     await fsp.rename(rebuilt, filePath);
     console.error(

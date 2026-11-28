@@ -90,12 +90,39 @@ export const ToolPermissionMetadata = z.discriminatedUnion("kind", [
     z.object({
         kind: z.literal("command"),
         commandNames: z.array(z.string()),
+        cwd: z.string().optional(),
+        reasons: z.array(z.string()).optional(),
+        allowScopeGrant: z.boolean().optional(),
     }),
     z.object({
         kind: z.literal("file"),
         operation: z.enum(["read", "list", "search", "write", "delete"]),
         paths: z.array(z.string()),
         pathPrefix: z.string(),
+        allowScopeGrant: z.boolean().optional(),
+    }),
+    z.object({
+        kind: z.literal("mcp"),
+        action: z.enum(["install", "spawn"]),
+        serverName: z.string(),
+        transport: z.enum(["stdio", "http"]),
+        command: z.string().optional(),
+        args: z.array(z.string()).optional(),
+        envKeys: z.array(z.string()).optional(),
+        envEntries: z
+            .array(
+                z.object({
+                    key: z.string(),
+                    value: z.string(),
+                    dangerous: z.boolean(),
+                }),
+            )
+            .optional(),
+        url: z.string().optional(),
+        headerKeys: z.array(z.string()).optional(),
+        warnings: z.array(z.string()).optional(),
+        configDigest: z.string().optional(),
+        allowScopeGrant: z.boolean().optional(),
     }),
 ]);
 
