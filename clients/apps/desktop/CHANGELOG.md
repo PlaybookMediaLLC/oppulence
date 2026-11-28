@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.1.37](https://github.com/PlaybookMediaLLC/oppulence/compare/v0.1.36...v0.1.37) (2026-11-28)
+
+
+### Features
+
+* add the generated TypeScript SDK under sdk/; remove dashboard, artifacts, fixtures ([#774](https://github.com/PlaybookMediaLLC/oppulence/issues/774)) ([b514863](https://github.com/PlaybookMediaLLC/oppulence/commit/b5148637a26138f9526c87264966eaf457d6725b))
+
+
+### Bug Fixes
+
+* **deps:** clear the govulncheck and desktop osv-scanner findings ([#781](https://github.com/PlaybookMediaLLC/oppulence/issues/781)) ([0d1b792](https://github.com/PlaybookMediaLLC/oppulence/commit/0d1b792efb43291d2b3f887387cd5c811168dbc7))
+* keep Rowboat where text means upstream; point config docs at ~/.oppulence ([#778](https://github.com/PlaybookMediaLLC/oppulence/issues/778)) ([9fdaea6](https://github.com/PlaybookMediaLLC/oppulence/commit/9fdaea6a0c4f5c11aeb788035f394cdfb612ad9a))
+
+
+### Documentation
+
+* require reuse-before-writing workflow for all agents ([#777](https://github.com/PlaybookMediaLLC/oppulence/issues/777)) ([ead1749](https://github.com/PlaybookMediaLLC/oppulence/commit/ead1749b388f94571952d3ad145ce2900683ff98))
+
+
+### Refactors
+
+* move to a Polar-style server/ + clients/ layout ([#772](https://github.com/PlaybookMediaLLC/oppulence/issues/772)) ([bc56bfb](https://github.com/PlaybookMediaLLC/oppulence/commit/bc56bfbee17563a0b4fc549df63bc4919716dce4))
+* rename rowboat to oppulence across code, docs, and paths ([#776](https://github.com/PlaybookMediaLLC/oppulence/issues/776)) ([7762434](https://github.com/PlaybookMediaLLC/oppulence/commit/7762434e1cdb74c8d585a22642567c5fc23d9c56))
+
 ## [0.1.36](https://github.com/PlaybookMediaLLC/oppulence/compare/v0.1.35...v0.1.36) (2026-10-27)
 
 
