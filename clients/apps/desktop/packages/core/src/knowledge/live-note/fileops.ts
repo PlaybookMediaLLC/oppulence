@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { LiveNoteSchema, type LiveNote } from '@x/shared/live-note';
 import { WorkDir } from '../../config/config.js';
+import { canonicalizePath, isPathInsideDir, isProtectedWorkspacePath, type FileAccessOperation } from '../../config/security.js';
 import { withFileLock } from '../file-lock.js';
 import { assertSafeRelPath } from '../../workspace/workspace.js';
 import { splitFrontmatter, joinFrontmatter } from '../../application/lib/parse-frontmatter.js';
@@ -26,10 +27,26 @@ function absPath(filePath: string): string {
     const resolved = path.resolve(KNOWLEDGE_DIR, filePath);
     // The root itself is legitimate: listLiveNotes' walk starts at absPath('').
     // resolveWorkspacePath carries the same clause for the same reason.
-    if (!resolved.startsWith(KNOWLEDGE_DIR + path.sep) && resolved !== KNOWLEDGE_DIR) {
+    if (!isPathInsideDir(KNOWLEDGE_DIR, resolved)) {
         throw new Error('Path outside knowledge boundary');
     }
     return resolved;
+}
+
+async function canonicalAbsPath(
+    filePath: string,
+    operation: FileAccessOperation = 'read',
+): Promise<string> {
+    const resolved = absPath(filePath);
+    const canonicalRoot = await fs.realpath(KNOWLEDGE_DIR).catch(() => path.resolve(KNOWLEDGE_DIR));
+    const canonicalTarget = await canonicalizePath(resolved);
+    if (!isPathInsideDir(canonicalRoot, canonicalTarget)) {
+        throw new Error('Path resolves outside knowledge boundary');
+    }
+    if (isProtectedWorkspacePath(canonicalTarget, operation)) {
+        throw new Error('Path targets protected workspace data');
+    }
+    return canonicalTarget;
 }
 
 function getLiveBlock(fm: Record<string, unknown>): unknown {
@@ -53,7 +70,7 @@ function setLiveBlock(fm: Record<string, unknown>, live: unknown): Record<string
 export async function fetchLiveNote(filePath: string): Promise<LiveNote | null> {
     let content: string;
     try {
-        content = await fs.readFile(absPath(filePath), 'utf-8');
+        content = await fs.readFile(await canonicalAbsPath(filePath, 'read'), 'utf-8');
     } catch {
         return null;
     }
@@ -67,7 +84,7 @@ export async function fetchLiveNote(filePath: string): Promise<LiveNote | null> 
 export async function readNoteBody(filePath: string): Promise<string> {
     let content: string;
     try {
-        content = await fs.readFile(absPath(filePath), 'utf-8');
+        content = await fs.readFile(await canonicalAbsPath(filePath, 'read'), 'utf-8');
     } catch {
         return '';
     }
@@ -85,11 +102,12 @@ export async function readNoteBody(filePath: string): Promise<string> {
  */
 export async function setLiveNote(filePath: string, live: LiveNote): Promise<void> {
     const validated = LiveNoteSchema.parse(live);
-    return withFileLock(absPath(filePath), async () => {
-        const content = await fs.readFile(absPath(filePath), 'utf-8');
+    const target = await canonicalAbsPath(filePath, 'write');
+    return withFileLock(target, async () => {
+        const content = await fs.readFile(target, 'utf-8');
         const { frontmatter, body } = splitFrontmatter(content);
         const nextFm = setLiveBlock(frontmatter, validated);
-        await fs.writeFile(absPath(filePath), joinFrontmatter(nextFm, body), 'utf-8');
+        await fs.writeFile(target, joinFrontmatter(nextFm, body), 'utf-8');
     });
 }
 
@@ -102,8 +120,9 @@ export async function patchLiveNote(
     filePath: string,
     updates: Partial<LiveNote>,
 ): Promise<void> {
-    return withFileLock(absPath(filePath), async () => {
-        const content = await fs.readFile(absPath(filePath), 'utf-8');
+    const target = await canonicalAbsPath(filePath, 'write');
+    return withFileLock(target, async () => {
+        const content = await fs.readFile(target, 'utf-8');
         const { frontmatter, body } = splitFrontmatter(content);
         const existing = getLiveBlock(frontmatter);
         if (!existing || typeof existing !== 'object') {
@@ -111,17 +130,18 @@ export async function patchLiveNote(
         }
         const merged = { ...(existing as Record<string, unknown>), ...updates };
         const nextFm = setLiveBlock(frontmatter, merged);
-        await fs.writeFile(absPath(filePath), joinFrontmatter(nextFm, body), 'utf-8');
+        await fs.writeFile(target, joinFrontmatter(nextFm, body), 'utf-8');
     });
 }
 
 export async function deleteLiveNote(filePath: string): Promise<void> {
-    return withFileLock(absPath(filePath), async () => {
-        const content = await fs.readFile(absPath(filePath), 'utf-8');
+    const target = await canonicalAbsPath(filePath, 'write');
+    return withFileLock(target, async () => {
+        const content = await fs.readFile(target, 'utf-8');
         const { frontmatter, body } = splitFrontmatter(content);
         if (!getLiveBlock(frontmatter)) return; // already passive
         const nextFm = setLiveBlock(frontmatter, null);
-        await fs.writeFile(absPath(filePath), joinFrontmatter(nextFm, body), 'utf-8');
+        await fs.writeFile(target, joinFrontmatter(nextFm, body), 'utf-8');
     });
 }
 
@@ -129,8 +149,9 @@ export async function setLiveNoteActive(
     filePath: string,
     active: boolean,
 ): Promise<LiveNoteSummary | null> {
-    return withFileLock(absPath(filePath), async () => {
-        const content = await fs.readFile(absPath(filePath), 'utf-8');
+    const target = await canonicalAbsPath(filePath, 'write');
+    return withFileLock(target, async () => {
+        const content = await fs.readFile(target, 'utf-8');
         const { frontmatter, body } = splitFrontmatter(content);
         const existing = getLiveBlock(frontmatter);
         if (!existing || typeof existing !== 'object') return null;
@@ -140,7 +161,7 @@ export async function setLiveNoteActive(
         if (currentlyActive !== active) {
             const merged = { ...current, active };
             const nextFm = setLiveBlock(frontmatter, merged);
-            await fs.writeFile(absPath(filePath), joinFrontmatter(nextFm, body), 'utf-8');
+            await fs.writeFile(target, joinFrontmatter(nextFm, body), 'utf-8');
         }
 
         const validated = await fetchLiveNote(filePath);
@@ -171,14 +192,14 @@ function buildSummaryFromStat(filePath: string, live: LiveNote, createdMs: numbe
 }
 
 async function buildSummary(filePath: string, live: LiveNote): Promise<LiveNoteSummary> {
-    const stats = await fs.stat(absPath(filePath));
+    const stats = await fs.stat(await canonicalAbsPath(filePath));
     const createdMs = stats.birthtimeMs > 0 ? stats.birthtimeMs : stats.ctimeMs;
     return buildSummaryFromStat(filePath, live, createdMs);
 }
 
 export async function listLiveNotes(): Promise<LiveNoteSummary[]> {
     async function walk(relativeDir = ''): Promise<string[]> {
-        const dirPath = absPath(relativeDir);
+        const dirPath = await canonicalAbsPath(relativeDir);
         try {
             const entries = await fs.readdir(dirPath, { withFileTypes: true });
             const files: string[] = [];

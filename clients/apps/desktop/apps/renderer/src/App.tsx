@@ -1420,7 +1420,7 @@ function App() {
   }, []);
 
   // Pending requests state
-  const [, setPendingPermissionRequests] = useState<
+  const [pendingPermissionRequests, setPendingPermissionRequests] = useState<
     Map<string, z.infer<typeof ToolPermissionRequestEvent>>
   >(new Map());
   const [pendingAskHumanRequests, setPendingAskHumanRequests] = useState<
@@ -3149,37 +3149,55 @@ function App() {
       subflow: string[],
       response: "approve" | "deny",
       scope?: "once" | "session" | "always",
-    ) => {
-      if (!runId) return;
+      targetRunId?: string,
+    ): Promise<boolean> => {
+      const effectiveRunId = targetRunId ?? runId;
+      if (!effectiveRunId) return false;
+      const isActiveRun = effectiveRunId === runId;
 
-      // Optimistically update the UI immediately
-      setPermissionResponses((prev) => {
-        const next = new Map(prev);
-        next.set(toolCallId, response);
-        return next;
-      });
-      setPendingPermissionRequests((prev) => {
-        const next = new Map(prev);
-        next.delete(toolCallId);
-        return next;
-      });
-
-      try {
-        await window.ipc.invoke("runs:authorizePermission", {
-          runId,
-          authorization: { subflow, toolCallId, response, scope },
-        });
-      } catch (error) {
-        console.error("Failed to authorize permission:", error);
-        // Revert the optimistic update on error
+      // Snapshot the pending request outside React's state updater so rollback is
+      // safe under React 19 concurrent/batched updates, and only mutate active-tab
+      // maps when targeting the active tab's run.
+      const removedPending = isActiveRun ? pendingPermissionRequests.get(toolCallId) : undefined;
+      if (isActiveRun) {
         setPermissionResponses((prev) => {
+          const next = new Map(prev);
+          next.set(toolCallId, response);
+          return next;
+        });
+        setPendingPermissionRequests((prev) => {
           const next = new Map(prev);
           next.delete(toolCallId);
           return next;
         });
       }
+
+      try {
+        await window.ipc.invoke("runs:authorizePermission", {
+          runId: effectiveRunId,
+          authorization: { subflow, toolCallId, response, scope },
+        });
+        return true;
+      } catch (error) {
+        console.error("Failed to authorize permission:", error);
+        if (runIdRef.current === effectiveRunId) {
+          setPermissionResponses((prev) => {
+            const next = new Map(prev);
+            next.delete(toolCallId);
+            return next;
+          });
+          if (removedPending) {
+            setPendingPermissionRequests((prev) => {
+              const next = new Map(prev);
+              next.set(toolCallId, removedPending);
+              return next;
+            });
+          }
+        }
+        return false;
+      }
     },
-    [runId],
+    [runId, pendingPermissionRequests],
   );
 
   // Answer a mid-run permission request from a code_agent_run coding turn. The
@@ -3191,19 +3209,17 @@ function App() {
       requestId: string,
       decision: "allow_once" | "allow_always" | "reject",
     ) => {
-      // Snapshot the pending request so the card can be restored if the resolve
-      // fails — otherwise a thrown invoke leaves the coding turn wedged with no
-      // card and no feedback. (ERRORS.md E31)
-      let prevPending: unknown = null;
+      // Snapshot the pending request outside React's state updater so rollback is
+      // safe under React 19 concurrent/batched updates. (ERRORS.md E31)
+      const targetItem = conversation.find((item) => isToolCall(item) && item.id === toolCallId);
+      const prevPending =
+        targetItem && isToolCall(targetItem) ? (targetItem.pendingCodePermission ?? null) : null;
       setConversation((prev) =>
-        prev.map((item) => {
-          if (isToolCall(item) && item.id === toolCallId) {
-            prevPending =
-              (item as { pendingCodePermission?: unknown }).pendingCodePermission ?? null;
-            return { ...item, pendingCodePermission: null };
-          }
-          return item;
-        }),
+        prev.map((item) =>
+          isToolCall(item) && item.id === toolCallId
+            ? { ...item, pendingCodePermission: null }
+            : item,
+        ),
       );
       try {
         await window.ipc.invoke("codeRun:resolvePermission", {
@@ -3216,22 +3232,23 @@ function App() {
         setConversation((prev) =>
           prev.map((item) =>
             isToolCall(item) && item.id === toolCallId
-              ? { ...item, pendingCodePermission: prevPending as never }
+              ? { ...item, pendingCodePermission: prevPending }
               : item,
           ),
         );
         toast.error("Couldn't send your decision to the coding agent. Please try again.");
       }
     },
-    [],
+    [conversation],
   );
 
   const handleAskHumanResponse = useCallback(
-    async (toolCallId: string, subflow: string[], response: string) => {
-      if (!runId) return;
+    async (toolCallId: string, subflow: string[], response: string, targetRunId?: string) => {
+      const effectiveRunId = targetRunId ?? runId;
+      if (!effectiveRunId) return;
       try {
         await window.ipc.invoke("runs:provideHumanInput", {
-          runId,
+          runId: effectiveRunId,
           reply: { subflow, toolCallId, response },
         });
       } catch (error) {
@@ -7610,6 +7627,8 @@ function App() {
                                                         permRequest.toolCall.toolCallId,
                                                         permRequest.subflow,
                                                         "approve",
+                                                        undefined,
+                                                        permRequest.runId || tab.runId || undefined,
                                                       )
                                                     }
                                                     onApproveSession={() =>
@@ -7618,6 +7637,7 @@ function App() {
                                                         permRequest.subflow,
                                                         "approve",
                                                         "session",
+                                                        permRequest.runId || tab.runId || undefined,
                                                       )
                                                     }
                                                     onApproveAlways={() =>
@@ -7626,6 +7646,7 @@ function App() {
                                                         permRequest.subflow,
                                                         "approve",
                                                         "always",
+                                                        permRequest.runId || tab.runId || undefined,
                                                       )
                                                     }
                                                     onDeny={() =>
@@ -7633,15 +7654,21 @@ function App() {
                                                         permRequest.toolCall.toolCallId,
                                                         permRequest.subflow,
                                                         "deny",
+                                                        undefined,
+                                                        permRequest.runId || tab.runId || undefined,
                                                       )
                                                     }
                                                     onSwitchAgent={async (newAgent) => {
-                                                      const runIdForSwitch = tab.runId;
-                                                      await handlePermissionResponse(
+                                                      const runIdForSwitch =
+                                                        permRequest.runId || tab.runId;
+                                                      const denied = await handlePermissionResponse(
                                                         permRequest.toolCall.toolCallId,
                                                         permRequest.subflow,
                                                         "deny",
+                                                        undefined,
+                                                        runIdForSwitch ?? undefined,
                                                       );
+                                                      if (!denied) return;
                                                       emitRendererEvent("code-mode-detected", {
                                                         runId: runIdForSwitch ?? undefined,
                                                         agent: newAgent,
@@ -7687,6 +7714,7 @@ function App() {
                                                 request.toolCallId,
                                                 request.subflow,
                                                 response,
+                                                request.runId || tab.runId || undefined,
                                               )
                                             }
                                             isProcessing={isActive && isProcessing}
@@ -7853,11 +7881,18 @@ function App() {
                   autoPermissionDecisions={autoPermissionDecisions}
                   onPermissionResponse={handlePermissionResponse}
                   onAskHumanResponse={handleAskHumanResponse}
-                  onSwitchAgent={async (toolCallId, subflow, newAgent) => {
-                    // Deny the coding-command request, then re-ask on the active run with
+                  onSwitchAgent={async (toolCallId, subflow, newAgent, targetRunId) => {
+                    // Deny the coding-command request, then re-ask on the targeted run with
                     // the swapped agent — parity with full-screen chat. (ERRORS.md E02)
-                    const runIdForSwitch = runId;
-                    await handlePermissionResponse(toolCallId, subflow, "deny");
+                    const runIdForSwitch = targetRunId ?? runId;
+                    const denied = await handlePermissionResponse(
+                      toolCallId,
+                      subflow,
+                      "deny",
+                      undefined,
+                      runIdForSwitch ?? undefined,
+                    );
+                    if (!denied) return;
                     emitRendererEvent("code-mode-detected", {
                       runId: runIdForSwitch ?? undefined,
                       agent: newAgent,

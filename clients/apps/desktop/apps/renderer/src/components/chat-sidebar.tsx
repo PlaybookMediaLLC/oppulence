@@ -181,11 +181,22 @@ interface ChatSidebarProps {
     subflow: string[],
     response: PermissionResponse,
     scope?: "once" | "session" | "always",
+    targetRunId?: string,
   ) => void;
-  onAskHumanResponse?: (toolCallId: string, subflow: string[], response: string) => void;
+  onAskHumanResponse?: (
+    toolCallId: string,
+    subflow: string[],
+    response: string,
+    targetRunId?: string,
+  ) => void;
   // Swap coding agent (Claude Code <-> Codex) and retry for a coding-command
   // permission request — parity with the full-screen chat. (ERRORS.md E02)
-  onSwitchAgent?: (toolCallId: string, subflow: string[], newAgent: "claude" | "codex") => void;
+  onSwitchAgent?: (
+    toolCallId: string,
+    subflow: string[],
+    newAgent: "claude" | "codex",
+    targetRunId?: string,
+  ) => void;
   isToolOpenForTab?: (tabId: string, toolId: string) => boolean;
   onToolOpenChangeForTab?: (tabId: string, toolId: string, open: boolean) => void;
   onOpenKnowledgeFile?: (path: string) => void;
@@ -801,6 +812,8 @@ export function ChatSidebar({
                                                 permRequest.toolCall.toolCallId,
                                                 permRequest.subflow,
                                                 "approve",
+                                                undefined,
+                                                permRequest.runId || tab.runId || undefined,
                                               )
                                             }
                                             onApproveSession={() =>
@@ -809,6 +822,7 @@ export function ChatSidebar({
                                                 permRequest.subflow,
                                                 "approve",
                                                 "session",
+                                                permRequest.runId || tab.runId || undefined,
                                               )
                                             }
                                             onApproveAlways={() =>
@@ -817,6 +831,7 @@ export function ChatSidebar({
                                                 permRequest.subflow,
                                                 "approve",
                                                 "always",
+                                                permRequest.runId || tab.runId || undefined,
                                               )
                                             }
                                             onDeny={() =>
@@ -824,6 +839,8 @@ export function ChatSidebar({
                                                 permRequest.toolCall.toolCallId,
                                                 permRequest.subflow,
                                                 "deny",
+                                                undefined,
+                                                permRequest.runId || tab.runId || undefined,
                                               )
                                             }
                                             onSwitchAgent={
@@ -833,6 +850,7 @@ export function ChatSidebar({
                                                       permRequest.toolCall.toolCallId,
                                                       permRequest.subflow,
                                                       newAgent,
+                                                      permRequest.runId || tab.runId || undefined,
                                                     )
                                                 : undefined
                                             }
@@ -860,6 +878,7 @@ export function ChatSidebar({
                                           request.toolCallId,
                                           request.subflow,
                                           response,
+                                          request.runId || tab.runId || undefined,
                                         )
                                       }
                                       isProcessing={isActive && isProcessing}

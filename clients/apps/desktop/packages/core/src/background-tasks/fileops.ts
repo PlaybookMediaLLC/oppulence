@@ -7,10 +7,20 @@ import {
     type BackgroundTaskSummary,
 } from '@x/shared/background-task';
 import { WorkDir } from '../config/config.js';
+import { canonicalizePath, isPathInsideDir, isSameNormalizedPath } from '../config/security.js';
 import { withFileLock } from '../knowledge/file-lock.js';
 import { writeJsonAtomic } from "../filesystem/atomic_write.js";
 
 const BG_TASKS_DIR = path.join(WorkDir, 'bg-tasks');
+
+async function assertCanonicalInsideBgTasks(targetPath: string): Promise<string> {
+    const canonicalRoot = await fs.realpath(BG_TASKS_DIR).catch(() => path.resolve(BG_TASKS_DIR));
+    const canonicalTarget = await canonicalizePath(targetPath);
+    if (!isPathInsideDir(canonicalRoot, canonicalTarget) || isSameNormalizedPath(canonicalTarget, canonicalRoot)) {
+        throw new Error('Background task path resolves outside bg-tasks boundary');
+    }
+    return canonicalTarget;
+}
 
 function syncTaskBestEffort(slug: string): void {
     void import('./cloud-sync.js')
@@ -80,7 +90,8 @@ export interface ArtifactSyncRecord {
 
 export async function readArtifactSync(slug: string): Promise<ArtifactSyncRecord | null> {
     try {
-        const raw = await fs.readFile(artifactSyncPath(slug), 'utf-8');
+        const target = await assertCanonicalInsideBgTasks(artifactSyncPath(slug));
+        const raw = await fs.readFile(target, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<ArtifactSyncRecord>;
         if (typeof parsed.revision !== 'number') return null;
         return {
@@ -95,7 +106,8 @@ export async function readArtifactSync(slug: string): Promise<ArtifactSyncRecord
 
 export async function writeArtifactSync(slug: string, record: ArtifactSyncRecord): Promise<void> {
     try {
-        await writeJsonAtomic(artifactSyncPath(slug), record);
+        const target = await assertCanonicalInsideBgTasks(artifactSyncPath(slug));
+        await writeJsonAtomic(target, record);
     } catch {
         // Sidecar is advisory; a write failure must not break the pull itself.
     }
@@ -103,7 +115,8 @@ export async function writeArtifactSync(slug: string, record: ArtifactSyncRecord
 
 export async function indexExists(slug: string): Promise<boolean> {
     try {
-        await fs.access(taskIndexPath(slug));
+        const target = await assertCanonicalInsideBgTasks(taskIndexPath(slug));
+        await fs.access(target);
         return true;
     } catch {
         return false;
@@ -145,7 +158,8 @@ export function slugify(name: string): string {
 export async function fetchTask(slug: string): Promise<BackgroundTask | null> {
     let raw: string;
     try {
-        raw = await fs.readFile(taskYamlPath(slug), 'utf-8');
+        const target = await assertCanonicalInsideBgTasks(taskYamlPath(slug));
+        raw = await fs.readFile(target, 'utf-8');
     } catch {
         return null;
     }
@@ -169,13 +183,14 @@ export async function fetchTask(slug: string): Promise<BackgroundTask | null> {
  * runner for the `lastRun*` runtime fields.
  */
 export async function patchTask(slug: string, partial: Partial<BackgroundTask>): Promise<BackgroundTask> {
-    const next = await withFileLock(taskYamlPath(slug), async () => {
+    const yamlTarget = await assertCanonicalInsideBgTasks(taskYamlPath(slug));
+    const next = await withFileLock(yamlTarget, async () => {
         const current = await fetchTask(slug);
         if (!current) {
             throw new Error(`Task '${slug}' not found`);
         }
         const next: BackgroundTask = { ...current, ...partial };
-        await fs.writeFile(taskYamlPath(slug), stringifyYaml(next), 'utf-8');
+        await fs.writeFile(yamlTarget, stringifyYaml(next), 'utf-8');
         return next;
     });
     syncTaskBestEffort(slug);
@@ -232,8 +247,10 @@ export async function createTask(input: CreateTaskInput): Promise<{ slug: string
         createdAt: new Date().toISOString(),
     };
 
-    await fs.writeFile(taskYamlPath(slug), stringifyYaml(task), 'utf-8');
-    await fs.writeFile(taskIndexPath(slug), `# ${input.name}\n\n`, 'utf-8');
+    const yamlTarget = await assertCanonicalInsideBgTasks(taskYamlPath(slug));
+    const indexTarget = await assertCanonicalInsideBgTasks(taskIndexPath(slug));
+    await fs.writeFile(yamlTarget, stringifyYaml(task), 'utf-8');
+    await fs.writeFile(indexTarget, `# ${input.name}\n\n`, 'utf-8');
 
     syncTaskBestEffort(slug);
     return { slug };
@@ -241,8 +258,16 @@ export async function createTask(input: CreateTaskInput): Promise<{ slug: string
 
 /** Delete a bg-task — removes the entire folder. */
 export async function deleteTask(slug: string): Promise<void> {
-    await withFileLock(taskYamlPath(slug), async () => {
-        await fs.rm(taskDir(slug), { recursive: true, force: true });
+    const dir = taskDir(slug);
+    const stat = await fs.lstat(dir).catch(() => null);
+    if (stat?.isSymbolicLink()) {
+        await fs.unlink(dir);
+        deleteCloudTaskBestEffort(slug);
+        return;
+    }
+    const canonicalDir = await assertCanonicalInsideBgTasks(dir);
+    await withFileLock(path.join(canonicalDir, 'task.yaml'), async () => {
+        await fs.rm(canonicalDir, { recursive: true, force: true });
     });
     deleteCloudTaskBestEffort(slug);
 }
@@ -322,8 +347,14 @@ export async function listTasks(opts: ListTasksOptions = {}): Promise<ListTasksR
 // ---------------------------------------------------------------------------
 
 export async function prependRunId(slug: string, runId: string): Promise<void> {
-    return withFileLock(taskYamlPath(slug), async () => {
-        const filePath = taskRunsLogPath(slug);
+    const lockTarget = await assertCanonicalInsideBgTasks(taskYamlPath(slug));
+    return withFileLock(lockTarget, async () => {
+        const rawRunsPath = taskRunsLogPath(slug);
+        const filePath = await assertCanonicalInsideBgTasks(rawRunsPath);
+        const existingStat = await fs.lstat(rawRunsPath).catch(() => null);
+        if (existingStat?.isSymbolicLink()) {
+            throw new Error('Refusing to write runs.log through symbolic link');
+        }
         let existing = '';
         try {
             existing = await fs.readFile(filePath, 'utf-8');
@@ -336,9 +367,15 @@ export async function prependRunId(slug: string, runId: string): Promise<void> {
 }
 
 export async function readRunIds(slug: string, limit?: number): Promise<string[]> {
+    const rawRunsPath = taskRunsLogPath(slug);
+    const filePath = await assertCanonicalInsideBgTasks(rawRunsPath);
+    const existingStat = await fs.lstat(rawRunsPath).catch(() => null);
+    if (existingStat?.isSymbolicLink()) {
+        throw new Error('Refusing to read runs.log through symbolic link');
+    }
     let content = '';
     try {
-        content = await fs.readFile(taskRunsLogPath(slug), 'utf-8');
+        content = await fs.readFile(filePath, 'utf-8');
     } catch (err: unknown) {
         const e = err as { code?: string };
         if (e.code === 'ENOENT') return [];

@@ -2,6 +2,7 @@ import { WorkDir } from "../config/config.js";
 import fs from "fs/promises";
 import path from "path";
 import { withFileLock } from "../knowledge/file-lock.js";
+import { writeJsonAtomic } from "../filesystem/atomic_write.js";
 import { OAuthTokens } from "./types.js";
 import z from "zod";
 import {
@@ -9,6 +10,14 @@ import {
   PRODUCT_PROVIDER_ID,
   isProductProvider,
 } from "@x/shared/branding";
+
+const RESERVED_PROVIDER_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function assertSafeOAuthProviderKey(provider: string): void {
+  if (!provider || RESERVED_PROVIDER_KEYS.has(provider)) {
+    throw new Error(`Invalid OAuth provider key: ${provider}`);
+  }
+}
 
 const ProviderConnectionSchema = z.object({
   tokens: OAuthTokens.nullable().optional(),
@@ -40,10 +49,12 @@ const ClientFacingConfigSchema = z.record(
 
 const LegacyOauthConfigSchema = z.record(z.string(), OAuthTokens);
 
-const DEFAULT_CONFIG: z.infer<typeof OAuthConfigSchema> = {
-  version: 2,
-  providers: {},
-};
+function createDefaultConfig(): z.infer<typeof OAuthConfigSchema> {
+  return {
+    version: 2,
+    providers: Object.create(null) as Record<string, ProviderConnection>,
+  };
+}
 
 export function isManagedAuthMode(mode: string | null | undefined): boolean {
   return mode === PRODUCT_PROVIDER_ID || mode === LEGACY_PRODUCT_PROVIDER_ID;
@@ -79,19 +90,30 @@ export class FSOAuthRepo implements IOAuthRepo {
     // check if payload conforms to updated schema
     const result = OAuthConfigSchema.safeParse(payload);
     if (result.success) {
-      return this.migrateProductProvider(result.data, false);
+      const safeProviders: Record<string, ProviderConnection> = Object.create(null) as Record<
+        string,
+        ProviderConnection
+      >;
+      for (const [provider, conn] of Object.entries(result.data.providers)) {
+        if (!RESERVED_PROVIDER_KEYS.has(provider)) {
+          safeProviders[provider] = conn;
+        }
+      }
+      return this.migrateProductProvider(
+        { version: result.data.version, providers: safeProviders },
+        false,
+      );
     }
 
     // otherwise attempt to parse as legacy schema
     const legacyConfig = LegacyOauthConfigSchema.parse(payload);
-    const updatedConfig: z.infer<typeof OAuthConfigSchema> = {
-      version: 2,
-      providers: {},
-    };
+    const updatedConfig = createDefaultConfig();
     for (const [provider, tokens] of Object.entries(legacyConfig)) {
-      updatedConfig.providers[provider] = {
-        tokens,
-      };
+      if (!RESERVED_PROVIDER_KEYS.has(provider)) {
+        updatedConfig.providers[provider] = {
+          tokens,
+        };
+      }
     }
     return this.migrateProductProvider(updatedConfig, true);
   }
@@ -108,30 +130,31 @@ export class FSOAuthRepo implements IOAuthRepo {
     return { config, migrated };
   }
 
-  private async readConfig(): Promise<z.infer<typeof OAuthConfigSchema>> {
+  private async readConfig(
+    allowMigrationWrite = false,
+  ): Promise<z.infer<typeof OAuthConfigSchema>> {
     try {
       const content = await fs.readFile(this.configPath, "utf8");
       const parsed = JSON.parse(content);
       const { config, migrated } = this.normalizeConfig(parsed);
-      if (migrated) {
+      if (migrated && allowMigrationWrite) {
         await this.writeConfig(config);
       }
       return config;
     } catch {
-      return { ...DEFAULT_CONFIG };
+      return createDefaultConfig();
     }
   }
 
   private async writeConfig(config: z.infer<typeof OAuthConfigSchema>): Promise<void> {
     // Crash-atomic: a write interrupted mid-flight must never leave a torn
     // oauth.json (it holds the only copy of rotating refresh tokens).
-    const tempPath = `${this.configPath}.tmp.${Date.now()}${Math.random().toString(36).slice(2)}`;
-    await fs.mkdir(path.dirname(this.configPath), { recursive: true });
-    await fs.writeFile(tempPath, JSON.stringify(config, null, 2));
-    await fs.rename(tempPath, this.configPath);
+    await fs.mkdir(path.dirname(this.configPath), { recursive: true, mode: 0o700 });
+    await writeJsonAtomic(this.configPath, config, 2, 0o600);
   }
 
   async read(provider: string): Promise<ProviderConnection> {
+    assertSafeOAuthProviderKey(provider);
     const config = await this.readConfig();
     if (isProductProvider(provider)) {
       return (
@@ -146,8 +169,9 @@ export class FSOAuthRepo implements IOAuthRepo {
   // stays lock-free (its rare migration write is idempotent and every locked
   // writer re-derives the migrated shape from disk before writing).
   async upsert(provider: string, connection: Partial<ProviderConnection>): Promise<void> {
+    assertSafeOAuthProviderKey(provider);
     await withFileLock(this.configPath, async () => {
-      const config = await this.readConfig();
+      const config = await this.readConfig(true);
       const providerKey = isProductProvider(provider) ? PRODUCT_PROVIDER_ID : provider;
       config.providers[providerKey] = { ...(config.providers[providerKey] ?? {}), ...connection };
       await this.writeConfig(config);
@@ -155,8 +179,9 @@ export class FSOAuthRepo implements IOAuthRepo {
   }
 
   async delete(provider: string): Promise<void> {
+    assertSafeOAuthProviderKey(provider);
     await withFileLock(this.configPath, async () => {
-      const config = await this.readConfig();
+      const config = await this.readConfig(true);
       if (isProductProvider(provider)) {
         delete config.providers[PRODUCT_PROVIDER_ID];
         delete config.providers[LEGACY_PRODUCT_PROVIDER_ID];
@@ -173,8 +198,9 @@ export class FSOAuthRepo implements IOAuthRepo {
     expectedRefreshToken: string | null,
     connection: Partial<ProviderConnection>,
   ): Promise<{ written: boolean; current: ProviderConnection }> {
+    assertSafeOAuthProviderKey(provider);
     return withFileLock(this.configPath, async () => {
-      const config = await this.readConfig();
+      const config = await this.readConfig(true);
       const providerKey = isProductProvider(provider) ? PRODUCT_PROVIDER_ID : provider;
       const existing =
         config.providers[providerKey] ??

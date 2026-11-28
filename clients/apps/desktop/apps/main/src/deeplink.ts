@@ -155,6 +155,40 @@ async function dispatchAction(url: string): Promise<void> {
  * the main window can be closed and the notification still has to work, which is the
  * whole reason capture moved into the main process.
  */
+async function resolveSafeCalendarEventPath(
+  eventId: string,
+  calendarRoot: string = path.resolve(WorkDir, "calendar_sync"),
+): Promise<string | null> {
+  const trimmed = eventId.trim();
+  if (
+    !trimmed ||
+    trimmed.includes("\0") ||
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes(":") ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    trimmed.includes("..")
+  ) {
+    return null;
+  }
+  const calendarDir = path.resolve(calendarRoot);
+  const candidate = path.resolve(calendarDir, `${trimmed}.json`);
+  if (path.dirname(candidate) !== calendarDir) {
+    return null;
+  }
+  try {
+    const canonicalDir = await fs.realpath(calendarDir);
+    const canonicalFile = await fs.realpath(candidate);
+    if (path.dirname(canonicalFile) !== canonicalDir) {
+      return null;
+    }
+    return canonicalFile;
+  } catch {
+    return null;
+  }
+}
+
 async function handleRecordMeeting(eventId: string): Promise<void> {
   const controller = peekMeetingController();
   if (!controller) {
@@ -162,6 +196,16 @@ async function handleRecordMeeting(eventId: string): Promise<void> {
     return;
   }
   if (controller.recording) return;
+
+  // Fail closed unless eventId resolves to an existing synced calendar event inside
+  // WorkDir/calendar_sync — prevents arbitrary untrusted deep links from silently
+  // activating microphone and system audio recording.
+  const safePath = await resolveSafeCalendarEventPath(eventId);
+  if (!safePath) {
+    console.error(`[deeplink] record-meeting: rejected invalid or unknown eventId "${eventId}"`);
+    return;
+  }
+
   // Standing by for this meeting already: promote, keeping the buffered minutes. Calling
   // `start` here would discard them and begin from the click, which is the one outcome
   // standby exists to avoid.
@@ -175,7 +219,7 @@ async function handleRecordMeeting(eventId: string): Promise<void> {
 
   let event: MeetingCalendarEvent | undefined;
   try {
-    const raw = await fs.readFile(path.join(WorkDir, "calendar_sync", `${eventId}.json`), "utf-8");
+    const raw = await fs.readFile(safePath, "utf-8");
     // Narrow rather than cast. calendar_sync holds the entire raw provider event,
     // so the previous cast persisted the description, attachments and recurrence
     // rules into the session's meta.json under a type that claimed none of them.
@@ -185,8 +229,13 @@ async function handleRecordMeeting(eventId: string): Promise<void> {
       source: "google",
     });
   } catch (err) {
-    // Start anyway: a recording with no calendar context still beats no recording.
-    console.warn(`[deeplink] record-meeting: could not read event ${eventId}`, err);
+    console.error(`[deeplink] record-meeting: could not read event ${eventId}`, err);
+    return;
+  }
+
+  if (!event) {
+    console.error(`[deeplink] record-meeting: calendar event ${eventId} could not be normalized`);
+    return;
   }
 
   const result = await controller.start(event);
@@ -200,13 +249,17 @@ async function handleTakeMeetingNotes(eventId: string, openMeeting: boolean): Pr
   if (!win || win.isDestroyed()) return;
   focusWindow(win);
 
-  const filePath = path.join(WorkDir, "calendar_sync", `${eventId}.json`);
+  const safePath = await resolveSafeCalendarEventPath(eventId);
+  if (!safePath) {
+    console.error(`[deeplink] take-meeting-notes: rejected invalid eventId "${eventId}"`);
+    return;
+  }
   let event: unknown;
   try {
-    const raw = await fs.readFile(filePath, "utf-8");
+    const raw = await fs.readFile(safePath, "utf-8");
     event = JSON.parse(raw);
   } catch (err) {
-    console.error(`[deeplink] take-meeting-notes: failed to read ${filePath}`, err);
+    console.error(`[deeplink] take-meeting-notes: failed to read ${safePath}`, err);
     return;
   }
 

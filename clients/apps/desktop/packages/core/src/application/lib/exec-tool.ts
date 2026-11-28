@@ -2,7 +2,19 @@ import { ToolAttachment } from "@x/shared/agent";
 import { RunEvent } from "@x/shared/runs";
 import { z } from "zod";
 import { BuiltinTools } from "./builtin-tools.js";
-import { executeTool } from "../../mcp/mcp.js";
+import {
+    computeStdioMcpConfigDigest,
+    executeTool,
+    getStdioMcpSpawnRequirement,
+    type McpSpawnPolicy,
+    type StdioMcpSpawnRequirement,
+} from "../../mcp/mcp.js";
+export {
+    computeStdioMcpConfigDigest,
+    getStdioMcpSpawnRequirement,
+    type McpSpawnPolicy,
+    type StdioMcpSpawnRequirement,
+};
 import { IAbortRegistry } from "../../runs/abort-registry.js";
 
 /**
@@ -18,10 +30,20 @@ export interface ToolContext {
     // it is the authoritative coding agent — code_agent_run uses it rather than the
     // agent the model guessed, so switching the chip deterministically switches agents.
     codeMode?: 'claude' | 'codex' | null;
+    // TOCTOU binding computed at permission-check time for MCP tool execution/listing.
+    mcpSpawnPolicy?: McpSpawnPolicy;
+    // Subflow path for nested agent tool calls (empty for top-level runs).
+    subflow?: string[];
 }
 
-async function execMcpTool(agentTool: z.infer<typeof ToolAttachment> & { type: "mcp" }, input: Record<string, unknown>): Promise<unknown> {
-    const result = await executeTool(agentTool.mcpServerName, agentTool.name, input);
+async function execMcpTool(
+    agentTool: z.infer<typeof ToolAttachment> & { type: "mcp" },
+    input: Record<string, unknown>,
+    ctx?: ToolContext,
+): Promise<unknown> {
+    const result = await executeTool(agentTool.mcpServerName, agentTool.name, input, {
+        spawnPolicy: ctx?.mcpSpawnPolicy,
+    });
     return result;
 }
 
@@ -32,7 +54,7 @@ export async function execTool(agentTool: z.infer<typeof ToolAttachment>, input:
     switch (agentTool.type) {
         case "mcp":
             // MCP tools: let complete on graceful stop (most are fast)
-            return execMcpTool(agentTool, input);
+            return execMcpTool(agentTool, input, ctx);
         case "builtin": {
             const builtinTool = BuiltinTools[agentTool.name];
             if (!builtinTool || !builtinTool.execute) {

@@ -1,4 +1,5 @@
 import { writeJsonAtomic } from "../filesystem/atomic_write.js";
+import { withFileLock } from "../knowledge/file-lock.js";
 import fs from 'fs/promises';
 import path from 'path';
 import { WorkDir } from '../config/config.js';
@@ -34,16 +35,22 @@ export class FSCodeModeConfigRepo implements ICodeModeConfigRepo {
             // in settings — always honor that choice.
             const content = await fs.readFile(this.configPath, 'utf8');
             return CodeModeConfig.parse(JSON.parse(content));
-        } catch {
-            // No explicit choice yet: enable automatically when a coding agent is ready.
-            return { enabled: await this.agentReady() };
+        } catch (error) {
+            if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+                // No explicit choice yet: enable automatically when a coding agent is ready.
+                return { enabled: await this.agentReady() };
+            }
+            // Corrupt/unreadable existing config fails closed rather than silently enabling Code Mode.
+            return { enabled: false };
         }
     }
 
     async setConfig(config: CodeModeConfig): Promise<void> {
         const validated = CodeModeConfig.parse(config);
-        await fs.mkdir(path.dirname(this.configPath), { recursive: true });
-        // Atomic: a torn file reverts an explicit opt-out to auto-detection.
-        await writeJsonAtomic(this.configPath, validated);
+        await withFileLock(this.configPath, async () => {
+            await fs.mkdir(path.dirname(this.configPath), { recursive: true });
+            // Atomic: a torn file reverts an explicit opt-out to auto-detection.
+            await writeJsonAtomic(this.configPath, validated, 2, 0o600);
+        });
     }
 }

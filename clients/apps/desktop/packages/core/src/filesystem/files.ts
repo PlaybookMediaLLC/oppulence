@@ -5,6 +5,14 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { glob as globFiles } from "glob";
 import { WorkDir } from "../config/config.js";
+import {
+  canonicalizePath,
+  isPathInsideDir,
+  isProtectedWorkspacePath,
+  isSameNormalizedPath,
+  resetSecurityAllowListCache,
+  SECURITY_CONFIG_PATH,
+} from "../config/security.js";
 import { withFileLock } from "../knowledge/file-lock.js";
 import { commitAll } from "../knowledge/version_history.js";
 import { rewriteWikiLinksForRenamedKnowledgeFile } from "../workspace/wiki-link-rewrite.js";
@@ -85,10 +93,7 @@ let knowledgeCommitTimer: ReturnType<typeof setTimeout> | null = null;
 let canonicalWorkspaceRoot: string | null = null;
 
 function isPathInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return (
-    relative === "" || (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
-  );
+  return isPathInsideDir(parent, child);
 }
 
 function expandHomePath(inputPath: string): string {
@@ -99,7 +104,7 @@ function expandHomePath(inputPath: string): string {
   if (trimmed === "~") {
     return os.homedir();
   }
-  if (trimmed.startsWith(`~${path.sep}`) || trimmed.startsWith("~/")) {
+  if (trimmed.startsWith(`~${path.sep}`) || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
     return path.join(os.homedir(), trimmed.slice(2));
   }
   return trimmed;
@@ -129,32 +134,10 @@ async function getCanonicalWorkspaceRoot(): Promise<string> {
   return canonicalWorkspaceRoot;
 }
 
-async function canonicalizePathForPermission(resolvedPath: string): Promise<string> {
-  try {
-    return await fs.realpath(resolvedPath);
-  } catch {
-    const parsed = path.parse(resolvedPath);
-    const missingParts: string[] = [];
-    let current = resolvedPath;
-
-    while (current !== parsed.root) {
-      try {
-        const canonicalParent = await fs.realpath(current);
-        return path.join(canonicalParent, ...missingParts.reverse());
-      } catch {
-        missingParts.push(path.basename(current));
-        current = path.dirname(current);
-      }
-    }
-
-    return path.resolve(resolvedPath);
-  }
-}
-
 export async function resolveFilePathForPermission(inputPath: string): Promise<CanonicalFilePath> {
   const resolved = resolveFilePath(inputPath);
   const [canonicalPath, workspaceRoot] = await Promise.all([
-    canonicalizePathForPermission(resolved.resolvedPath),
+    canonicalizePath(resolved.resolvedPath),
     getCanonicalWorkspaceRoot(),
   ]);
   const isInsideWorkspace = isPathInside(workspaceRoot, canonicalPath);
@@ -287,6 +270,11 @@ export async function stat(
 
 export async function list(inputPath: string, opts?: ReaddirOptions): Promise<Array<DirEntry>> {
   const root = resolveFilePath(inputPath || ".");
+  const workspaceRoot = await getCanonicalWorkspaceRoot();
+  const rootCanonical = await canonicalizePath(root.resolvedPath);
+  const rootInsideWorkspace = isPathInside(workspaceRoot, rootCanonical);
+  const rootIsProtected =
+    rootInsideWorkspace && isProtectedWorkspacePath(rootCanonical, "list", workspaceRoot);
   const entries: Array<DirEntry> = [];
 
   async function readDir(currentPath: string, currentDisplayPath: string): Promise<void> {
@@ -300,6 +288,16 @@ export async function list(inputPath: string, opts?: ReaddirOptions): Promise<Ar
       }
 
       const itemPath = path.join(currentPath, item.name);
+      if (rootInsideWorkspace && !rootIsProtected) {
+        const itemCanonical = await canonicalizePath(itemPath);
+        if (
+          !isPathInside(workspaceRoot, itemCanonical) ||
+          isProtectedWorkspacePath(itemCanonical, "list", workspaceRoot)
+        ) {
+          continue;
+        }
+      }
+
       const displayPath = path.posix.join(currentDisplayPath.split(path.sep).join("/"), item.name);
       const itemKind = item.isDirectory() ? "dir" : item.isFile() ? "file" : null;
       if (!itemKind) continue;
@@ -473,12 +471,35 @@ export async function writeText(inputPath: string, data: string, opts?: WriteTex
     }
 
     const buffer = Buffer.from(data, "utf8");
+    const canonicalConfigDir = await canonicalizePath(path.join(WorkDir, "config"));
+    const canonicalTarget = await canonicalizePath(resolved.resolvedPath);
+    const isConfigWrite = isPathInsideDir(canonicalConfigDir, canonicalTarget);
     if (atomic) {
       const tempPath = `${resolved.resolvedPath}${ATOMIC_TMP_INFIX}${Date.now()}${Math.random().toString(36).slice(2)}`;
-      await fs.writeFile(tempPath, buffer);
+      await fs.writeFile(tempPath, buffer, isConfigWrite ? { mode: 0o600 } : undefined);
       await fs.rename(tempPath, resolved.resolvedPath);
     } else {
-      await fs.writeFile(resolved.resolvedPath, buffer);
+      try {
+        const targetStat = await fs.lstat(resolved.resolvedPath);
+        if (targetStat.isSymbolicLink()) {
+          throw new Error("Refusing non-atomic write through symbolic link");
+        }
+      } catch (err: unknown) {
+        if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) {
+          throw err;
+        }
+      }
+      await fs.writeFile(
+        resolved.resolvedPath,
+        buffer,
+        isConfigWrite ? { mode: 0o600 } : undefined,
+      );
+    }
+    if (isConfigWrite && process.platform !== "win32") {
+      await fs.chmod(resolved.resolvedPath, 0o600);
+    }
+    if (isSameNormalizedPath(resolved.resolvedPath, SECURITY_CONFIG_PATH) || isConfigWrite) {
+      resetSecurityAllowListCache();
     }
 
     if (entityNote) {
@@ -562,7 +583,7 @@ export async function rename(
 
   if (!overwrite) {
     try {
-      await fs.access(dest.resolvedPath);
+      await fs.lstat(dest.resolvedPath);
       throw new Error("Destination already exists");
     } catch (err: unknown) {
       if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
@@ -573,8 +594,24 @@ export async function rename(
     }
   }
 
+  const canonicalConfigDir = await canonicalizePath(path.join(WorkDir, "config"));
+  const canonicalSource = await canonicalizePath(source.resolvedPath);
+  const canonicalDestBefore = await canonicalizePath(dest.resolvedPath);
+
   await fs.mkdir(path.dirname(dest.resolvedPath), { recursive: true });
   await fs.rename(source.resolvedPath, dest.resolvedPath);
+
+  const canonicalDest = await canonicalizePath(dest.resolvedPath);
+  if (isPathInsideDir(canonicalConfigDir, canonicalDest) && process.platform !== "win32") {
+    await fs.chmod(dest.resolvedPath, 0o600).catch(() => undefined);
+  }
+  if (
+    isPathInsideDir(canonicalConfigDir, canonicalSource) ||
+    isPathInsideDir(canonicalConfigDir, canonicalDestBefore) ||
+    isPathInsideDir(canonicalConfigDir, canonicalDest)
+  ) {
+    resetSecurityAllowListCache();
+  }
 
   if (fromStats.isFile() && entityKindForPath(dest.resolvedPath, path.join(WorkDir, "knowledge"))) {
     await stabilizeEntityNoteMutation(dest.resolvedPath, WorkDir);
@@ -613,21 +650,30 @@ export async function copy(
     throw new Error("Copying directories is not supported");
   }
 
-  if (!overwrite) {
-    try {
-      await fs.access(dest.resolvedPath);
-      throw new Error("Destination already exists");
-    } catch (err: unknown) {
-      if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
-        // destination does not exist
-      } else {
-        throw err;
-      }
+  // Use lstat so dangling symlinks are detected and never followed by copyFile.
+  const destStats = await fs.lstat(dest.resolvedPath).catch((err: unknown) => {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+      return null;
     }
+    throw err;
+  });
+  if (destStats?.isSymbolicLink()) {
+    throw new Error("Refusing to copy onto a symbolic link");
+  }
+  if (!overwrite && destStats) {
+    throw new Error("Destination already exists");
   }
 
   await fs.mkdir(path.dirname(dest.resolvedPath), { recursive: true });
   await fs.copyFile(source.resolvedPath, dest.resolvedPath);
+  const canonicalConfigDir = await canonicalizePath(path.join(WorkDir, "config"));
+  const canonicalDest = await canonicalizePath(dest.resolvedPath);
+  if (isPathInsideDir(canonicalConfigDir, canonicalDest)) {
+    if (process.platform !== "win32") {
+      await fs.chmod(dest.resolvedPath, 0o600);
+    }
+    resetSecurityAllowListCache();
+  }
   if (entityKindForPath(dest.resolvedPath, path.join(WorkDir, "knowledge"))) {
     await stabilizeEntityNoteMutation(dest.resolvedPath, WorkDir);
   }
@@ -641,6 +687,9 @@ export async function remove(
   const resolved = resolveFilePath(inputPath);
   const stats = await fs.lstat(resolved.resolvedPath);
   const trash = opts?.trash !== false;
+  const canonicalConfigDir = await canonicalizePath(path.join(WorkDir, "config"));
+  const canonicalTarget = await canonicalizePath(resolved.resolvedPath);
+  const touchesConfig = isPathInsideDir(canonicalConfigDir, canonicalTarget);
 
   if (trash) {
     const trashDir = path.join(WorkDir, ".trash");
@@ -659,6 +708,9 @@ export async function remove(
       }
     }
     await fs.rename(resolved.resolvedPath, finalTrashPath);
+    if (touchesConfig) {
+      resetSecurityAllowListCache();
+    }
     return {
       ok: true,
       path: resolved.originalPath,
@@ -675,8 +727,86 @@ export async function remove(
   } else {
     await fs.unlink(resolved.resolvedPath);
   }
+  if (touchesConfig) {
+    resetSecurityAllowListCache();
+  }
   return { ok: true, path: resolved.originalPath, resolvedPath: resolved.resolvedPath };
 }
+
+async function inspectGlobPatternScope(
+  rawPattern: string | undefined,
+  rootCanonical: string,
+  workspaceRoot: string,
+): Promise<{ allowProtectedSubtree: boolean; allowOutsideRoot: boolean }> {
+  const rootIsProtected = isProtectedWorkspacePath(rootCanonical, "search", workspaceRoot);
+  if (!rawPattern) {
+    return { allowProtectedSubtree: rootIsProtected, allowOutsideRoot: false };
+  }
+  const trimmed = rawPattern.trim().replace(/\\/g, "/");
+  if (!trimmed) {
+    return { allowProtectedSubtree: rootIsProtected, allowOutsideRoot: false };
+  }
+  // Brace-expansion patterns (e.g. `{/etc/passwd,ok.txt}` or `{..,x}/config/*`)
+  // must NEVER disable canonical root/protected post-filtering.
+  if (trimmed.includes("{") || trimmed.includes("}")) {
+    return { allowProtectedSubtree: rootIsProtected, allowOutsideRoot: false };
+  }
+
+  const normalizedRel = trimmed.replace(/^(?:\.\/)+/, "");
+  const hasAbsoluteOrHome =
+    normalizedRel.startsWith("/") ||
+    normalizedRel.startsWith("~") ||
+    /^[A-Za-z]:/.test(normalizedRel);
+  const hasParentTraversal = normalizedRel.split("/").includes("..");
+  const allowOutsideRoot = hasAbsoluteOrHome || hasParentTraversal;
+
+  // Determine the static directory prefix strictly BEFORE the segment containing
+  // the first wildcard character (up to the last `/`), never slicing mid-segment
+  // (e.g. `config*/*` has NO static parent directory, NOT `config`).
+  const wildcardIdx = normalizedRel.search(/[*?[]/);
+  let staticPart: string;
+  if (wildcardIdx === -1) {
+    staticPart = normalizedRel;
+  } else {
+    const beforeWildcard = normalizedRel.slice(0, wildcardIdx);
+    const lastSlash = beforeWildcard.lastIndexOf("/");
+    staticPart = lastSlash === -1 ? "" : beforeWildcard.slice(0, lastSlash);
+  }
+  let staticDir: string;
+  if (!staticPart) {
+    staticDir = rootCanonical;
+  } else {
+    const expandedStatic = staticPart.startsWith("~") ? expandHomePath(staticPart) : staticPart;
+    const resolvedStatic = path.isAbsolute(expandedStatic)
+      ? path.resolve(expandedStatic)
+      : path.resolve(rootCanonical, expandedStatic);
+    staticDir = await canonicalizePath(resolvedStatic);
+  }
+
+  const allowProtectedSubtree =
+    rootIsProtected ||
+    (staticPart.length > 0 && isProtectedWorkspacePath(staticDir, "search", workspaceRoot)) ||
+    /^(?:config|runs|\.trash|code-mode|runtime|models|cache|index|events|logs|\.git)(?:\/|$)/i.test(
+      normalizedRel,
+    );
+
+  return { allowProtectedSubtree, allowOutsideRoot };
+}
+
+const WORKSPACE_ROOT_PROTECTED_IGNORE = [
+  "node_modules/**",
+  "**/.git/**",
+  "config/**",
+  "runs/**",
+  ".trash/**",
+  "code-mode/**",
+  "runtime/**",
+  "models/**",
+  "cache/**",
+  "index/**",
+  "events/**",
+  "logs/**",
+];
 
 export async function glob(
   pattern: string,
@@ -690,16 +820,54 @@ export async function glob(
   resolvedCwd: string;
 }> {
   const root = resolveFilePath(cwd || ".");
-  const files = await globFiles(pattern, {
+  const workspaceRoot = await getCanonicalWorkspaceRoot();
+  const rootCanonical = await canonicalizePath(root.resolvedPath);
+  const rootInsideWorkspace = isPathInside(workspaceRoot, rootCanonical);
+  const { allowProtectedSubtree, allowOutsideRoot } = await inspectGlobPatternScope(
+    pattern,
+    rootCanonical,
+    workspaceRoot,
+  );
+  const isWorkspaceRoot = root.workspaceRelPath === "";
+  const ignore =
+    isWorkspaceRoot && !allowProtectedSubtree
+      ? WORKSPACE_ROOT_PROTECTED_IGNORE
+      : allowProtectedSubtree
+        ? ["node_modules/**"]
+        : ["node_modules/**", "**/.git/**"];
+  const rawFiles = await globFiles(pattern, {
     cwd: root.resolvedPath,
     nodir: true,
-    ignore: ["node_modules/**", ".git/**"],
+    ignore,
   });
-  const resolvedFiles = files.map((file) => path.resolve(root.resolvedPath, file));
+
+  const filteredFiles: string[] = [];
+  const resolvedFiles: string[] = [];
+  for (const file of rawFiles) {
+    const resolvedFile = path.resolve(root.resolvedPath, file);
+    const canonicalFile = await canonicalizePath(resolvedFile);
+    if (!allowOutsideRoot) {
+      if (
+        !isPathInside(rootCanonical, canonicalFile) ||
+        (rootInsideWorkspace && !isPathInside(workspaceRoot, canonicalFile))
+      ) {
+        continue;
+      }
+    }
+    if (
+      !allowProtectedSubtree &&
+      isProtectedWorkspacePath(canonicalFile, "search", workspaceRoot)
+    ) {
+      continue;
+    }
+    filteredFiles.push(file);
+    resolvedFiles.push(resolvedFile);
+  }
+
   return {
-    files,
+    files: filteredFiles,
     resolvedFiles,
-    count: files.length,
+    count: filteredFiles.length,
     pattern,
     cwd: cwd || ".",
     resolvedCwd: root.resolvedPath,
@@ -721,11 +889,26 @@ export async function grep({
 }) {
   const root = resolveFilePath(searchPath || ".");
   const stats = await fs.lstat(root.resolvedPath);
+  const workspaceRoot = await getCanonicalWorkspaceRoot();
+  const rootCanonical = await canonicalizePath(root.resolvedPath);
+  const rootInsideWorkspace = isPathInside(workspaceRoot, rootCanonical);
+  const { allowProtectedSubtree, allowOutsideRoot } = await inspectGlobPatternScope(
+    fileGlob,
+    rootCanonical,
+    workspaceRoot,
+  );
+  const isWorkspaceRoot = root.workspaceRelPath === "";
+  const ignore =
+    isWorkspaceRoot && !allowProtectedSubtree
+      ? WORKSPACE_ROOT_PROTECTED_IGNORE
+      : allowProtectedSubtree
+        ? ["node_modules/**"]
+        : ["node_modules/**", "**/.git/**"];
   const candidates = stats.isDirectory()
     ? await globFiles(fileGlob || "**/*", {
         cwd: root.resolvedPath,
         nodir: true,
-        ignore: ["node_modules/**", ".git/**"],
+        ignore,
         dot: false,
       })
     : [path.basename(root.resolvedPath)];
@@ -743,6 +926,21 @@ export async function grep({
   for (const candidate of candidates) {
     if (matches.length >= maxResults) break;
     const resolvedPath = stats.isDirectory() ? path.resolve(baseDir, candidate) : root.resolvedPath;
+    const canonicalCandidate = await canonicalizePath(resolvedPath);
+    if (!allowOutsideRoot) {
+      if (
+        (stats.isDirectory() && !isPathInside(rootCanonical, canonicalCandidate)) ||
+        (rootInsideWorkspace && !isPathInside(workspaceRoot, canonicalCandidate))
+      ) {
+        continue;
+      }
+    }
+    if (
+      !allowProtectedSubtree &&
+      isProtectedWorkspacePath(canonicalCandidate, "search", workspaceRoot)
+    ) {
+      continue;
+    }
     try {
       await assertTextFile(resolvedPath);
       const text = await fs.readFile(resolvedPath, "utf8");

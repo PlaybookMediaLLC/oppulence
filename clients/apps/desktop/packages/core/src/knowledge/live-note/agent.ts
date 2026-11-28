@@ -1,6 +1,6 @@
 import z from 'zod';
 import { Agent, ToolAttachment } from '@x/shared/agent';
-import { BuiltinTools } from '../../application/lib/builtin-tools.js';
+import { BuiltinTools, HEADLESS_EXCLUDED_TOOLS } from '../../application/lib/builtin-tools.js';
 import { KNOWLEDGE_NOTE_STYLE_GUIDE } from '../../application/lib/knowledge-note-style.js';
 import { WorkDir } from '../../config/config.js';
 
@@ -152,9 +152,9 @@ Avoid: "I updated the note.", "Done!", "Here is the update:". The summary is a d
 export function buildLiveNoteAgent(): z.infer<typeof Agent> {
     const tools: Record<string, z.infer<typeof ToolAttachment>> = {};
     for (const name of Object.keys(BuiltinTools)) {
-        // code_agent_run requires an interactive UI for permission approvals — skip it
-        // here (headless) so it can't hang on an approval no one can answer.
-        if (name === 'executeCommand' || name === 'code_agent_run') continue;
+        // Skip tools that require interactive user approval, expose server config,
+        // mutate scheduled tasks/memory, or recursively trigger headless agents.
+        if (HEADLESS_EXCLUDED_TOOLS.has(name)) continue;
         tools[name] = { type: 'builtin', name };
     }
 

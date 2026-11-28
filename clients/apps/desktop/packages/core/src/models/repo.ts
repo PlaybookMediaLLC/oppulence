@@ -138,7 +138,7 @@ export class FSModelConfigRepo implements IModelConfigRepo {
         try {
             raw = await fs.readFile(this.configPath, "utf8");
         } catch {
-            await writeJsonAtomic(this.configPath, defaultConfig);
+            await writeJsonAtomic(this.configPath, defaultConfig, 2, 0o600);
             return;
         }
 
@@ -160,7 +160,7 @@ export class FSModelConfigRepo implements IModelConfigRepo {
             // Writing the replacement before renaming shrinks that window to a
             // pair of renames, and the write itself is atomic.
             const rebuilt = `${this.configPath}.rebuilt-${stamp}`;
-            await writeJsonAtomic(rebuilt, config);
+            await writeJsonAtomic(rebuilt, config, 2, 0o600);
             await fs.rename(this.configPath, quarantinePath);
             await fs.rename(rebuilt, this.configPath);
             console.error(
@@ -187,34 +187,48 @@ export class FSModelConfigRepo implements IModelConfigRepo {
     }
 
     async setConfig(config: z.infer<typeof ModelConfig>): Promise<void> {
+        const validatedConfig = ModelConfig.parse(config);
         // Locked: the merge below reads the existing providers map, and a lost
         // update drops another provider's API key.
         return withFileLock(this.configPath, async () => {
-        let existingProviders: Record<string, Record<string, unknown>> = {};
+        type ProvidersMap = NonNullable<z.infer<typeof ModelConfig>["providers"]>;
+        const existingProviders: ProvidersMap = Object.create(null) as ProvidersMap;
         try {
             const raw = await fs.readFile(this.configPath, "utf8");
-            const existing = JSON.parse(raw);
-            existingProviders = existing.providers || {};
+            const existingRaw: unknown = JSON.parse(raw);
+            if (existingRaw && typeof existingRaw === "object" && "providers" in existingRaw) {
+                const parsedProviders = ModelConfig.shape.providers.safeParse(
+                    (existingRaw as { providers?: unknown }).providers,
+                );
+                if (parsedProviders.success && parsedProviders.data) {
+                    for (const [k, v] of Object.entries(parsedProviders.data)) {
+                        if (k !== "__proto__" && k !== "constructor" && k !== "prototype") {
+                            existingProviders[k] = v;
+                        }
+                    }
+                }
+            }
         } catch {
             // No existing config
         }
 
-        existingProviders[config.provider.flavor] = {
-            ...existingProviders[config.provider.flavor],
-            apiKey: config.provider.apiKey,
-            baseURL: config.provider.baseURL,
-            headers: config.provider.headers,
-            model: config.model,
-            models: config.models,
-            knowledgeGraphModel: config.knowledgeGraphModel,
-            meetingNotesModel: config.meetingNotesModel,
-            liveNoteAgentModel: config.liveNoteAgentModel,
-            autoPermissionDecisionModel: config.autoPermissionDecisionModel,
+        const flavor = validatedConfig.provider.flavor;
+        existingProviders[flavor] = {
+            ...existingProviders[flavor],
+            apiKey: validatedConfig.provider.apiKey,
+            baseURL: validatedConfig.provider.baseURL,
+            headers: validatedConfig.provider.headers,
+            model: validatedConfig.model,
+            models: validatedConfig.models,
+            knowledgeGraphModel: validatedConfig.knowledgeGraphModel,
+            meetingNotesModel: validatedConfig.meetingNotesModel,
+            liveNoteAgentModel: validatedConfig.liveNoteAgentModel,
+            autoPermissionDecisionModel: validatedConfig.autoPermissionDecisionModel,
         };
 
-        const toWrite = { ...config, providers: existingProviders };
+        const toWrite = ModelConfig.parse({ ...validatedConfig, providers: existingProviders });
         // Atomic: this file carries the user's API keys; a torn write loses them.
-        await writeJsonAtomic(this.configPath, toWrite);
+        await writeJsonAtomic(this.configPath, toWrite, 2, 0o600);
         });
     }
 }

@@ -11,6 +11,7 @@ import { MemoryIndex, type IndexChunk } from './store.js';
 import type { Chunk } from './types.js';
 import { writeJsonAtomicSync } from "../filesystem/atomic_write.js";
 import { hasFrontmatter } from '../knowledge/frontmatter.js';
+import { isPathInsideDir, isProtectedWorkspacePath } from '../config/security.js';
 
 /**
  * Embeds a batch of texts and reports the token cost. Injected into {@link Indexer}
@@ -349,15 +350,28 @@ const MAIL_ID_PREFIX = 'gmail_sync';
 function walkMarkdown(root: string): string[] {
     const out: string[] = [];
     if (!fs.existsSync(root)) return out;
+    let canonicalRoot: string;
+    try {
+        canonicalRoot = fs.realpathSync(root);
+    } catch {
+        return out;
+    }
     // Track visited real directory paths so a symlink cycle can't loop forever.
     const visited = new Set<string>();
-    const stack = [root];
+    const stack = [canonicalRoot];
     while (stack.length > 0) {
-        const dir = stack.pop()!;
+        const dir = stack.pop();
+        if (!dir) continue;
         let real: string;
         try {
             real = fs.realpathSync(dir);
         } catch {
+            continue;
+        }
+        if (
+            !isPathInsideDir(canonicalRoot, real)
+            || isProtectedWorkspacePath(real, 'search')
+        ) {
             continue;
         }
         if (visited.has(real)) continue;
@@ -369,15 +383,24 @@ function walkMarkdown(root: string): string[] {
             continue;
         }
         for (const entry of entries) {
+            if (entry.name.startsWith('.')) continue;
             const full = path.join(dir, entry.name);
+            let realEntry: string;
             let st: fs.Stats;
             try {
-                st = fs.statSync(full); // follows symlinks; the visited set breaks cycles
+                realEntry = fs.realpathSync(full);
+                st = fs.statSync(realEntry);
             } catch {
                 continue; // dangling symlink / permission error
             }
-            if (st.isDirectory()) stack.push(full);
-            else if (st.isFile() && entry.name.endsWith('.md')) out.push(full);
+            if (
+                !isPathInsideDir(canonicalRoot, realEntry)
+                || isProtectedWorkspacePath(realEntry, 'search')
+            ) {
+                continue;
+            }
+            if (st.isDirectory()) stack.push(realEntry);
+            else if (st.isFile() && entry.name.endsWith('.md')) out.push(realEntry);
         }
     }
     out.sort();

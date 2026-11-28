@@ -1,11 +1,12 @@
 import { writeJsonAtomic } from "../filesystem/atomic_write.js";
+import { withFileLock } from "../knowledge/file-lock.js";
 import { WorkDir } from "../config/config.js";
 import { AgentScheduleConfig, AgentScheduleEntry } from "@x/shared/agent-schedule";
 import path from "path";
 import z from "zod";
 import { ensureJsonConfig, readJsonConfig } from "../config/json_config.js";
 
-const DEFAULT_AGENT_SCHEDULES: z.infer<typeof AgentScheduleConfig>["agents"] = {};
+const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface IAgentScheduleRepo {
     ensureConfig(): Promise<void>;
@@ -14,7 +15,7 @@ export interface IAgentScheduleRepo {
     delete(agentName: string): Promise<void>;
 }
 
-const defaults = (): z.infer<typeof AgentScheduleConfig> => ({ agents: DEFAULT_AGENT_SCHEDULES });
+const defaults = (): z.infer<typeof AgentScheduleConfig> => ({ agents: {} });
 
 export class FSAgentScheduleRepo implements IAgentScheduleRepo {
     private readonly configPath = path.join(WorkDir, "config", "agent-schedule.json");
@@ -39,16 +40,26 @@ export class FSAgentScheduleRepo implements IAgentScheduleRepo {
     }
 
     async upsert(agentName: string, entry: z.infer<typeof AgentScheduleEntry>): Promise<void> {
-        const conf = await this.getConfig();
-        conf.agents[agentName] = entry;
-        // Atomic: a torn file reads as defaults — every schedule gone.
-        await writeJsonAtomic(this.configPath, conf);
+        if (!agentName.trim() || RESERVED_KEYS.has(agentName)) {
+            throw new Error(`Invalid scheduled agent name "${agentName}"`);
+        }
+        await withFileLock(this.configPath, async () => {
+            const conf = await this.getConfig();
+            conf.agents[agentName] = AgentScheduleEntry.parse(entry);
+            // Atomic: a torn file reads as defaults — every schedule gone.
+            await writeJsonAtomic(this.configPath, conf, 2, 0o600);
+        });
     }
 
     async delete(agentName: string): Promise<void> {
-        const conf = await this.getConfig();
-        delete conf.agents[agentName];
-        // Atomic: a torn file reads as defaults — every schedule gone.
-        await writeJsonAtomic(this.configPath, conf);
+        if (!agentName.trim() || RESERVED_KEYS.has(agentName)) {
+            throw new Error(`Invalid scheduled agent name "${agentName}"`);
+        }
+        await withFileLock(this.configPath, async () => {
+            const conf = await this.getConfig();
+            delete conf.agents[agentName];
+            // Atomic: a torn file reads as defaults — every schedule gone.
+            await writeJsonAtomic(this.configPath, conf, 2, 0o600);
+        });
     }
 }
