@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.38](https://github.com/PlaybookMediaLLC/oppulence/compare/v0.1.37...v0.1.38) (2026-11-28)
+
+
+### Bug Fixes
+
+* **desktop:** harden command approval, MCP spawning, and path/IPC boundaries ([#834](https://github.com/PlaybookMediaLLC/oppulence/issues/834)) ([b9dc42d](https://github.com/PlaybookMediaLLC/oppulence/commit/b9dc42dc02fcce8f45bcc9435026b12eb45232f8))
+
 ## [0.1.37](https://github.com/PlaybookMediaLLC/oppulence/compare/v0.1.36...v0.1.37) (2026-11-28)
 
 
