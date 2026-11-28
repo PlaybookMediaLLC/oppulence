@@ -9,7 +9,10 @@
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "hooks:run": "lefthook run pre-commit --all-files",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "devx:video-evidence": "node scripts/devx/video-evidence/cli.mjs",
+    "devx:video-evidence:validate": "node scripts/devx/video-evidence/validate-cli.mjs",
+    "test:video-evidence": "node --test scripts/devx/video-evidence/__tests__/*.test.mjs"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",
